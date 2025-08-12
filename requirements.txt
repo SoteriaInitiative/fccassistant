@@ -1,0 +1,10 @@
+google-cloud-aiplatform>=1.66.0
+vertexai>=1.66.0
+google-cloud-storage
+pymupdf
+numpy~=1.26.4
+faiss~=1.9.0
+faiss-cpu~=1.9.0
+tqdm~=4.67.1
+protobuf~=5.29.5
+requests~=2.32.4
