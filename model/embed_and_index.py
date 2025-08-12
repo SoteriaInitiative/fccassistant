@@ -161,6 +161,8 @@ def main():
     print(f"   meta:    {out_meta}")
     print(f"   index:   {out_faiss}")
 
+    upload_index_files()
+
     # Optional upload to GCS
     if UPLOAD_INDEX_TO_GCS:
         try:
@@ -173,6 +175,49 @@ def main():
             print("   ", uri3)
         except Exception as e:
             print("⚠️  Upload skipped/failed:", e)
+
+import os
+from pathlib import Path
+from google.cloud import storage
+from config import GCS_CORPUS_BUCKET, WORKDIR, INDEX_PREFIX
+
+def upload_index_files():
+    """Uploads embeddings, faiss index, meta, and corpus_chunks.jsonl to the GCS index folder."""
+    files_to_upload = [
+        "embeddings.npy",
+        "faiss.index",
+        "embeddings_meta.jsonl",
+        "corpus_chunks.jsonl"
+    ]
+
+    # Resolve bucket and optional base prefix from GCS_CORPUS_BUCKET
+    def _bucket_and_prefix(gs_or_name: str):
+        v = gs_or_name.strip()
+        if v.startswith("gs://"):
+            parts = v[5:].split("/", 1)
+            return parts[0], (parts[1] if len(parts) > 1 else "")
+        if "/" in v:
+            b, p = v.split("/", 1)
+            return b, p
+        return v, ""
+
+    bucket_name, base_prefix = _bucket_and_prefix(GCS_CORPUS_BUCKET)
+
+    client = storage.Client()
+
+    for fname in files_to_upload:
+        local_path = Path(WORKDIR) / fname
+        if not local_path.exists():
+            print(f"⚠️  File not found, skipping: {local_path}")
+            continue
+
+        object_path = "/".join(
+            [p for p in [base_prefix, INDEX_PREFIX, fname] if p]
+        )
+        blob = client.bucket(bucket_name).blob(object_path)
+        blob.upload_from_filename(str(local_path))
+        print(f"✅ Uploaded {fname} → gs://{bucket_name}/{object_path}")
+
 
 if __name__ == "__main__":
     main()

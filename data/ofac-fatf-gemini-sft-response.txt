@@ -1,0 +1,91 @@
+### **Task 1 - Based on the FATF's standards, namely FATF Recommendations 24 and 25, identify all of Co A's beneficial owners.**
+
+The provided context for FATF Recommendation 24, footnote 62, states that "Controlling shareholders... may be based on a threshold, e.g. any persons owning more than a certain percentage of the company (determined based on the jurisdiction’s assessment of risk, with a maximum of 25%)." The scenario specifies that Country X applies a **15% threshold** for the identification of beneficial ownership.
+
+To identify Co A's beneficial owners, we trace direct and indirect ownership to see which ultimate beneficial owners (natural persons or entities recognized as such by the threshold) meet or exceed the 15% threshold.
+
+1.  **SDN A's direct ownership of Co A:** 3%. (Does not meet 15% threshold).
+
+2.  **Through Co B (47% ownership of Co A):**
+    *   Co B is 42% owned by SDN B.
+        *   SDN B's indirect ownership of Co A: 42% of 47% = 0.42 * 0.47 = 0.1974 = **19.74%**. (Meets 15% threshold).
+    *   Co B is 52% owned by Co D.
+        *   Co D's indirect ownership of Co A: 52% of 47% = 0.52 * 0.47 = 0.2444 = 24.44%.
+        *   Co D is 50% owned by Person C.
+            *   Person C's indirect ownership of Co A: 50% of 24.44% = 0.50 * 0.2444 = 0.1222 = **12.22%**. (Does not meet 15% threshold).
+        *   Co D is 50% owned by SDN D.
+            *   SDN D's indirect ownership of Co A: 50% of 24.44% = 0.50 * 0.2444 = 0.1222 = **12.22%**. (Does not meet 15% threshold).
+
+3.  **Through Co C (50% ownership of Co A):**
+    *   Co C is 52% owned by Trust.
+        *   Trust's indirect ownership of Co A: 52% of 50% = 0.52 * 0.50 = 0.26 = **26%**. (Meets 15% threshold).
+        *   The context states "Trust is managed by Settlor, Trust is managed by Trustee, Trust is managed by Beneficiary". While FATF Recommendation 25 states that similar measures should apply to trusts as to companies regarding beneficial ownership, the provided context for R.24 and R.25 does not specify how "managed by" translates into a percentage of ownership that could be applied to the 15% threshold for the Settlor, Trustee, or Beneficiary themselves. The context emphasizes identifying "natural person(s) who are the beneficial owner(s), and the means and mechanisms through which they exercise beneficial ownership or control." Without a specified percentage ownership for these individuals *within* the Trust or how their management translates into a percentage of downstream ownership for the purpose of the 15% threshold, I cannot definitively identify them as beneficial owners by percentage.
+    *   Co C is 48% owned by Co E.
+        *   Co E's indirect ownership of Co A: 48% of 50% = 0.48 * 0.50 = 0.24 = 24%.
+        *   Co E is 19% owned by Person E.
+            *   Person E's indirect ownership of Co A: 19% of 24% = 0.19 * 0.24 = 0.0456 = **4.56%**. (Does not meet 15% threshold).
+        *   Co E is 81% owned by SDN F.
+            *   SDN F's indirect ownership of Co A: 81% of 24% = 0.81 * 0.24 = 0.1944 = **19.44%**. (Meets 15% threshold).
+
+**Conclusion for Task 1:**
+Based on the 15% beneficial ownership threshold for Country X and the provided FATF context, Co A's beneficial owners are:
+*   **SDN B** (19.74% indirect ownership)
+*   **SDN F** (19.44% indirect ownership)
+
+While the Trust indirectly owns 26% of Co A, the context does not provide sufficient information to determine the percentage beneficial ownership of the Settlor, Trustee, or Beneficiary of the Trust for the purpose of applying the 15% threshold.
+
+---
+
+### **Task 2 - Is Co A subject to US sanctions, which of its intermediate blocking entities direct or indirect owners contribute to the designation? Please refer to OFAC FAQ 401 for guidance.**
+
+OFAC's 50 Percent Rule (FAQ 401) states that "the property and interests in property of entities directly or indirectly owned 50 percent or more in the aggregate by one or more blocked persons are considered blocked." The rule is applied in two ways, as demonstrated by the examples:
+1.  **Aggregate ownership by blocked persons:** Sum of direct and indirect ownership percentages by blocked persons. Indirect ownership counts only through intermediate entities that are *themselves 50 percent or more owned in the aggregate by the blocked person(s)*.
+2.  **Aggregate ownership by blocked entities:** Sum of direct ownership percentages by entities that are themselves blocked.
+
+Let's analyze the ownership structure for Co A using these methods:
+
+**1. Identify all Specially Designated Nationals (SDNs):**
+*   SDN A
+*   SDN B
+*   SDN D
+*   SDN F
+
+**2. Evaluate Intermediate Entity Blocking:**
+*   **Co D:** Owned 50% by SDN D.
+    *   **Result: Co D is Blocked.** (50% owned by a Blocked Person, SDN D).
+*   **Co B:** Owned 42% by SDN B and 52% by Co D.
+    *   Since Co D is blocked and owns 52% of Co B (>=50%), **Result: Co B is Blocked.**
+*   **Co E:** Owned 19% by Person E and 81% by SDN F.
+    *   Since SDN F owns 81% of Co E (>=50%), **Result: Co E is Blocked.**
+*   **Co C:** Owned 52% by Trust and 48% by Co E.
+    *   Co E is blocked, but its ownership of Co C is 48% (<50%). The Trust is not identified as a blocked person.
+    *   **Result: Co C is NOT Blocked.** (Its direct owner Co E owns less than 50%).
+
+**3. Evaluate Co A's Blocked Status based on Aggregate Ownership:**
+
+*   **Method A: Aggregate ownership by Blocked Persons (Direct and Indirect through 50%+ owned entities):**
+    *   **SDN A:** Directly owns 3% of Co A.
+    *   **SDN B:** Owns 42% of Co B. Since Co B is not 50% or more owned by SDN B, SDN B's indirect ownership of Co A through Co B is *not counted* as per the definition of "indirectly" in FAQ 401 ("through another entity or entities that are 50 percent or more owned in the aggregate by the blocked person(s)"). Contribution: 0%.
+    *   **SDN D:** Owns 50% of Co D. Co D owns 52% of Co B. Co B owns 47% of Co A. Although SDN D causes Co D and Co B to be blocked, the chain of *indirect ownership for calculation purposes* terminates if an intermediate entity owns less than 50% of the next entity. In this path (SDN D -> Co D -> Co B -> Co A), Co B owns 47% of Co A, which is less than 50%. Therefore, SDN D's indirect ownership contribution to Co A is 0% for the purpose of the aggregate ownership calculation.
+    *   **SDN F:** Owns 81% of Co E. Co E owns 48% of Co C. Since Co E owns 48% of Co C (less than 50%), SDN F's indirect ownership contribution to Co A through this chain is 0%.
+    *   **Total Blocked Persons' Indirect Ownership of Co A:** 3% (from SDN A). This is less than 50%.
+
+*   **Method B: Aggregate ownership by Blocked Persons AND Blocked Entities:**
+    *   Co A is 3% owned by **SDN A** (a blocked person).
+    *   Co A is 47% owned by **Co B** (a blocked entity, as identified above).
+    *   Co A is 50% owned by Co C (not a blocked entity).
+    *   **Aggregate ownership of Co A by blocked persons/entities:** 3% (SDN A) + 47% (Co B) = **50%**.
+
+Since the aggregate ownership of Co A by blocked persons and blocked entities is 50%, Co A is considered blocked under OFAC's 50 Percent Rule.
+
+**Conclusion for Task 2:**
+
+Yes, **Co A is subject to US sanctions** under OFAC's 50 Percent Rule.
+
+The entities whose blocked status or direct ownership by a blocked person contribute to Co A's designation are:
+*   **SDN A** (due to its direct 3% ownership of Co A).
+*   **Co B** (due to its direct 47% ownership of Co A and its own blocked status).
+*   **Co D** (because its blocked status leads to Co B being blocked).
+*   **SDN D** (because its blocked status leads to Co D being blocked).
+
+SDN F and Co E are blocked, but their chain of ownership does not cause Co A to be blocked under the 50 Percent Rule, as Co E's ownership of Co C (48%) is less than the 50% threshold required to block Co C, and Co C is not otherwise blocked.
