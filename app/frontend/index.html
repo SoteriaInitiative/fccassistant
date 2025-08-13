@@ -1,0 +1,247 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Ask Simons - FCC AI Assistant MVP</title>
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif; margin: 0; }
+    header { display:flex; align-items:center; justify-content:space-between; padding: 12px 16px; border-bottom:1px solid #eee; }
+    .brand { font-weight:600; }
+    .controls { display:flex; gap: 8px; align-items:center; }
+    .container { max-width: 880px; margin: 0 auto; padding: 16px; }
+    .row { display:flex; gap:8px; }
+    #query { flex: 1; padding: 10px; font-size: 15px; }
+    button { padding: 10px 14px; font-size: 15px; cursor: pointer; }
+    .chat { margin-top: 16px; display:flex; flex-direction: column; gap: 12px; }
+    .msg { padding: 12px; border-radius: 10px; }
+    .user { background: #eef6ff; align-self: flex-end; }
+    .bot { background: #f5f5f5; align-self: flex-start; }
+    .ctx { font-size: 13px; color: #444; white-space: pre-wrap; border-left: 3px solid #ddd; padding-left: 10px; }
+    .small { font-size: 12px; color: #666; }
+    .hidden { display:none; }
+    .auth { display:flex; gap:8px; align-items:center; }
+    .auth input { padding: 8px; font-size: 14px; }
+    .statusbar { margin-top: 8px; font-size: 12px; color: #444; }
+    .statusbar .ok { color: #0a7; }
+    .statusbar .warn { color: #a70; }
+    .statusbar .err { color: #a00; }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="brand">Ask Simons - FCC AI Assistant MVP</div>
+    <div class="controls">
+      <select id="model">
+        <option value="base">Base model</option>
+        <option value="tuned">Tuned model</option>
+      </select>
+
+      <!-- Auth controls -->
+      <div id="auth-signed-out" class="auth">
+        <input id="email" type="email" placeholder="email@domain.com" autocomplete="username" />
+        <input id="password" type="password" placeholder="Password" autocomplete="current-password" />
+        <button id="signin">Sign in</button>
+      </div>
+
+      <div id="auth-signed-in" class="auth hidden">
+        <span id="whoami" class="small"></span>
+        <button id="logout">Sign out</button>
+      </div>
+    </div>
+  </header>
+
+  <div class="container">
+    <div id="chat-ui" class="hidden">
+      <div class="row">
+        <input id="query" placeholder="Ask a sanctions question..." />
+        <button id="send">Send</button>
+      </div>
+      <div id="status" class="statusbar"></div>
+      <div class="chat" id="chat"></div>
+    </div>
+
+    <div id="please-login" class="small">
+      Ask Simons in private beta testing.
+      Please message <a href="https://www.linkedin.com/in/john-cusack-48107a7b/">John</a> or
+      <a href="https://www.linkedin.com/in/jeanvoigt/">Jean</a> for access.
+    </div>
+  </div>
+
+<script>
+const api_base = location.origin; // same-origin Cloud Run
+
+const $ = (id) => document.getElementById(id);
+const chat = $("chat");
+const statusEl = $("status");
+let session_token = null;
+
+function logStatus(text, cls="") {
+  const ts = new Date().toLocaleTimeString();
+  statusEl.innerHTML = `<span class="mono">${ts}</span> — <span class="${cls}">${text}</span>`;
+  console.log("[status]", text);
+}
+
+function addMsg(text, who="bot") {
+  const div = document.createElement("div");
+  div.className = "msg " + who;
+  div.textContent = text;
+  chat.appendChild(div);
+  chat.scrollTop = chat.scrollHeight;
+}
+
+function addContexts(ctxs) {
+  const div = document.createElement("div");
+  div.className = "msg bot";
+  let html = "<div class='small'><b>Contexts</b></div>";
+  for (const c of ctxs) {
+    html += `<div class="ctx"><div class='small'><b>${c.doc}</b> • chunk ${c.chunk_id} • score ${c.score.toFixed(3)}</div>${c.text.slice(0, 800)}</div>`;
+  }
+  div.innerHTML = html;
+  chat.appendChild(div);
+  chat.scrollTop = chat.scrollHeight;
+}
+
+function showSignedIn(email) {
+  $("auth-signed-out").classList.add("hidden");
+  $("auth-signed-in").classList.remove("hidden");
+  $("whoami").textContent = email || "";
+  $("please-login").classList.add("hidden");
+  $("chat-ui").classList.remove("hidden");
+}
+
+function showSignedOut() {
+  $("auth-signed-in").classList.add("hidden");
+  $("auth-signed-out").classList.remove("hidden");
+  $("whoami").textContent = "";
+  $("chat-ui").classList.add("hidden");
+  $("please-login").classList.remove("hidden");
+  session_token = null;
+}
+
+/** ---- Auth: Sign in / Sign out ---- */
+
+$("signin").onclick = async () => {
+  const email = $("email").value.trim();
+  const password = $("password").value;
+  if (!email || !password) return alert("Enter email and password.");
+  try {
+    logStatus("Calling /api/login …");
+    const res = await fetch(`${api_base}/api/login`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ email, password }),
+    });
+    const data = await res.json().catch(()=>({}));
+    if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`);
+    session_token = data.token;
+    logStatus("Login OK", "ok");
+    showSignedIn(email);
+  } catch (e) {
+    logStatus("Login failed: " + e.message, "err");
+    alert("Sign-in failed: " + e.message);
+  }
+};
+
+$("logout").onclick = async () => {
+  try {
+    if (session_token) {
+      logStatus("Calling /api/logout …");
+      await fetch(`${api_base}/api/logout`, {
+        method: "POST",
+        headers: { "Authorization": `Bearer ${session_token}` },
+      });
+    }
+  } catch (e) {
+    console.warn("logout failed", e);
+  } finally {
+    logStatus("Signed out", "warn");
+    showSignedOut();
+  }
+};
+
+/** ---- Chat send with heartbeat & timing ---- */
+$("send").onclick = async () => {
+  const q = $("query").value.trim();
+  if (!q) return;
+
+  const reqId = crypto.randomUUID();
+  const started = Date.now();
+  let hbTimer = null, elapsedTimer = null;
+
+  addMsg(q, "user");
+  $("query").value = "";
+  addMsg("Thinking…", "bot");
+  logStatus(`Calling /api/chat (req ${reqId}) …`);
+
+  // Heartbeat: ping /api/health while the request is in flight
+  const startHeartbeat = () => {
+    let hbCount = 0;
+    hbTimer = setInterval(async () => {
+      hbCount++;
+      try {
+        const r = await fetch(`${api_base}/api/health`, { method: "GET" });
+        const ok = r.ok ? "healthy" : `HTTP ${r.status}`;
+        console.log(`[hb ${reqId}] /api/health -> ${ok}`);
+      } catch (e) {
+        console.warn(`[hb ${reqId}] health error`, e);
+      }
+    }, 2000);
+  };
+
+  // Elapsed indicator in status bar
+  const startElapsed = () => {
+    elapsedTimer = setInterval(() => {
+      const s = Math.round((Date.now() - started)/1000);
+      logStatus(`Working… ${s}s elapsed (req ${reqId})`);
+    }, 1000);
+  };
+
+  startHeartbeat();
+  startElapsed();
+
+  // Build request (with token + request ID header)
+  const headers = { "Content-Type": "application/json", "X-Client-Request-ID": reqId };
+  if (session_token) headers["Authorization"] = `Bearer ${session_token}`;
+
+  // Use AbortController for a generous timeout (e.g., 300s)
+  const ctrl = new AbortController();
+  const timeoutMs = 300000;
+  const timeout = setTimeout(() => ctrl.abort("timeout"), timeoutMs);
+
+  try {
+    const res = await fetch(`${api_base}/api/chat`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ query: q, top_k: 5, model: $("model").value }),
+      signal: ctrl.signal,
+    });
+
+    const text = await res.text();
+    let data;
+    try { data = JSON.parse(text); }
+    catch { throw new Error(`Non-JSON response (HTTP ${res.status}): ${text.slice(0,200)}`); }
+
+    const dt = Math.round((Date.now() - started));
+    chat.lastChild.textContent = data.answer || (data.detail || `HTTP ${res.status}`);
+    if (data.contexts) addContexts(data.contexts);
+
+    const reqHeader = res.headers.get("X-Request-ID");
+    logStatus(`Done in ${dt}ms (req ${reqHeader || reqId})`, res.ok ? "ok" : "warn");
+    console.log("chat response", { status: res.status, headers: Object.fromEntries(res.headers.entries()), data });
+  } catch (e) {
+    const dt = Math.round((Date.now() - started));
+    const msg = (e && e.message) ? e.message : String(e);
+    chat.lastChild.textContent = "Error: " + msg;
+    logStatus(`Error after ${dt}ms (req ${reqId}): ${msg}`, "err");
+    console.error("chat error", e);
+  } finally {
+    clearTimeout(timeout);
+    if (hbTimer) clearInterval(hbTimer);
+    if (elapsedTimer) clearInterval(elapsedTimer);
+  }
+};
+</script>
+</body>
+</html>
