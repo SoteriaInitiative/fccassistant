@@ -21,7 +21,7 @@ from vertexai.preview.generative_models import GenerativeModel
 
 # ---------- Logging ----------
 logging.basicConfig(level=logging.INFO)
-log = logging.getLogger("ask-simons")
+log = logging.getLogger(os.getenv("SERVICE_APP_NAME"))
 
 def _timer(name: str):
     t0 = time.time()
@@ -227,7 +227,7 @@ def generate_answer(query: str, contexts, use_tuned: bool):
         t(model=model_name)
 
 # ---------- FastAPI app ----------
-app = FastAPI(title="Ask Simons - FCC Assistant MVP")
+app = FastAPI(title="FCC Assistant MVP")
 
 # CORS for non-same-origin testing
 if ALLOW_CORS_ALL:
