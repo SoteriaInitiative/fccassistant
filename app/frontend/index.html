@@ -1,0 +1,341 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>FCC AI Assistant MVP</title>
+  <!-- Tailwind CSS -->
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = {
+      theme: {
+        extend: {
+          colors: {
+            brand: { DEFAULT: "#0f172a", light: "#1e293b", accent: "#0ea5e9" },
+            bank:   { bg: "#f8fafc", card: "#ffffff", border: "#e2e8f0" }
+          }
+        }
+      }
+    }
+  </script>
+  <!-- Markdown + Sanitizer -->
+  <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/dompurify@3.1.7/dist/purify.min.js"></script>
+  <style>
+    /* Subtle, always-visible scrollbar (desktop) */
+    .scrolly::-webkit-scrollbar { width: 10px; }
+    .scrolly::-webkit-scrollbar-track { background: #f1f5f9; }
+    .scrolly::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 8px; }
+    .scrolly:hover::-webkit-scrollbar-thumb { background: #94a3b8; }
+    /* Firefox */
+    .scrolly { scrollbar-width: thin; scrollbar-color: #cbd5e1 #f1f5f9; }
+    /* Typography for bot messages */
+    .prose-chat :where(p,ul,ol,pre,code,blockquote,h1,h2,h3){ margin:0.25rem 0; }
+    .prose-chat pre{ background:#0b1220; color:#e2e8f0; padding:.75rem; border-radius:.5rem; overflow:auto; }
+    .prose-chat code{ background:#f1f5f9; padding:.1rem .3rem; border-radius:.25rem; }
+  </style>
+</head>
+<body class="min-h-screen bg-bank-bg text-slate-900">
+  <!-- Header -->
+  <header class="sticky top-0 z-30 bg-white/90 backdrop-blur border-b border-bank-border">
+    <div class="mx-auto max-w-4xl px-4 py-3 flex items-center justify-between">
+      <div class="flex items-center gap-2">
+        <svg class="h-6 w-6 text-brand-accent" viewBox="0 0 24 24" fill="none" stroke="currentColor">
+          <path d="M12 3l8 4v6c0 5-3.5 7.5-8 8-4.5-.5-8-3-8-8V7l8-4z" stroke-width="1.5"/>
+          <path d="M8.5 12l2.5 2.5 4.5-4.5" stroke-width="1.5"/>
+        </svg>
+        <h1 class="text-sm sm:text-base font-semibold">FCC AI Assistant MVP</h1>
+      </div>
+
+      <!-- Right side (auth-dependent) -->
+      <div class="flex items-center gap-3">
+        <!-- Model select (hidden until authenticated) -->
+        <div id="model_wrap" class="hidden">
+          <select id="model" class="text-sm border border-bank-border rounded-lg px-3 py-2 bg-white focus:outline-none focus:ring-2 focus:ring-brand-accent">
+            <option value="base">Base model</option>
+            <option value="tuned">Tuned model</option>
+          </select>
+        </div>
+
+        <!-- User info + logout (hidden until authenticated) -->
+        <div id="user_wrap" class="hidden items-center gap-2">
+          <span id="whoami" class="text-xs sm:text-sm text-slate-600"></span>
+          <button id="logout" class="text-xs sm:text-sm px-3 py-2 rounded-lg border border-bank-border hover:bg-slate-50">
+            Sign out
+          </button>
+        </div>
+      </div>
+    </div>
+  </header>
+
+  <!-- Main -->
+  <main class="mx-auto max-w-4xl px-4 flex flex-col min-h-[calc(100vh-64px)]">
+    <!-- Unauthenticated: login card + request access -->
+    <section id="auth_card" class="flex-1 flex items-center justify-center">
+      <div class="w-full max-w-md bg-bank-card border border-bank-border rounded-2xl shadow-sm p-6">
+        <h2 class="text-lg font-semibold mb-2">Welcome</h2>
+        <p class="text-sm text-slate-600 mb-6">
+          The FCC AI Assistant is in private beta testing.
+          Please message
+          <a class="text-brand-accent underline" href="https://www.linkedin.com/in/jeanvoigt/" target="_blank" rel="noopener">Jean</a>
+          for access.
+        </p>
+
+        <div class="space-y-3">
+          <div>
+            <label for="email" class="block text-sm text-slate-700 mb-1">Email</label>
+            <input id="email" type="email" autocomplete="username"
+                   class="w-full rounded-lg border border-bank-border px-3 py-2 focus:outline-none focus:ring-2 focus:ring-brand-accent"
+                   placeholder="email@domain.com">
+          </div>
+          <div>
+            <label for="password" class="block text-sm text-slate-700 mb-1">Password</label>
+            <input id="password" type="password" autocomplete="current-password"
+                   class="w-full rounded-lg border border-bank-border px-3 py-2 focus:outline-none focus:ring-2 focus:ring-brand-accent"
+                   placeholder="••••••••">
+          </div>
+          <button id="signin"
+                  class="w-full bg-brand-accent text-white rounded-lg py-2.5 font-medium hover:opacity-95 transition">
+            Sign in
+          </button>
+        </div>
+      </div>
+    </section>
+
+    <!-- Authenticated: chat layout -->
+    <section id="app" class="hidden flex-1 flex flex-col">
+      <!-- Messages scroll area -->
+      <div id="chat" class="flex-1 overflow-y-auto scrolly py-4 space-y-4">
+        <!-- messages get appended here -->
+      </div>
+
+      <!-- Composer (bottom) -->
+      <div class="sticky bottom-0 bg-white border-t border-bank-border">
+        <form id="composer" class="max-w-4xl mx-auto px-0 py-3 flex items-end gap-2">
+          <textarea id="query" rows="1" placeholder="Type a question ..."
+                    class="flex-1 resize-y max-h-40 rounded-xl border border-bank-border px-4 py-3 focus:outline-none focus:ring-2 focus:ring-brand-accent"
+                    ></textarea>
+          <button id="send" type="submit"
+                  class="shrink-0 bg-brand-accent text-white px-4 py-3 rounded-xl font-medium hover:opacity-95 transition">
+            Send
+          </button>
+        </form>
+      </div>
+    </section>
+  </main>
+
+  <script>
+    const api_base = location.origin;
+
+    const $ = (id) => document.getElementById(id);
+    const chatEl = $("chat");
+    let session_token = null;
+
+    // --- Helpers ---
+    const scrollToBottom = () => { chatEl.scrollTop = chatEl.scrollHeight; };
+
+    function addMsg(content, who = "bot", isMarkdown = false) {
+      const wrapper = document.createElement("div");
+      const bubble = document.createElement("div");
+
+      wrapper.className = `px-2 flex ${who === "user" ? "justify-end" : "justify-start"}`;
+      bubble.className = [
+        "max-w-[85%] rounded-2xl px-4 py-3 shadow",
+        who === "user" ? "bg-sky-50 border border-sky-100" : "bg-white border border-bank-border"
+      ].join(" ");
+
+      if (isMarkdown) {
+        // Safe markdown rendering
+        const html = DOMPurify.sanitize(marked.parse(content, { breaks: true }));
+        const inner = document.createElement("div");
+        inner.className = "prose prose-sm prose-slate prose-chat max-w-none";
+        inner.innerHTML = html;
+        bubble.appendChild(inner);
+      } else {
+        bubble.textContent = content;
+      }
+
+      wrapper.appendChild(bubble);
+      chatEl.appendChild(wrapper);
+      scrollToBottom();
+    }
+
+    function addContexts(ctxs = []) {
+      if (!ctxs.length) return;
+      const wrapper = document.createElement("div");
+      wrapper.className = "px-2 flex justify-start";
+      const card = document.createElement("div");
+      card.className = "max-w-[85%] bg-white border border-bank-border rounded-2xl px-4 py-3 shadow";
+
+      const title = document.createElement("div");
+      title.className = "text-xs font-semibold text-slate-600 mb-2";
+      title.textContent = `Context (${ctxs.length})`;
+      card.appendChild(title);
+
+      const list = document.createElement("div");
+      list.className = "space-y-2";
+      ctxs.forEach(c => {
+        const row = document.createElement("div");
+        row.className = "text-xs text-slate-700 border-l-2 border-slate-200 pl-3";
+        row.innerHTML = `<div class="font-medium">${c.doc}</div>
+                         <div class="text-slate-500">chunk ${c.chunk_id} • score ${Number(c.score).toFixed(3)}</div>
+                         <div class="mt-1 text-slate-600">${(c.text || "").slice(0, 800)}</div>`;
+        list.appendChild(row);
+      });
+      card.appendChild(list);
+      wrapper.appendChild(card);
+      chatEl.appendChild(wrapper);
+      scrollToBottom();
+    }
+
+    function showSignedIn(email) {
+      // header toggles
+      $("model_wrap").classList.remove("hidden");
+      $("user_wrap").classList.remove("hidden");
+      $("whoami").textContent = email || "";
+
+      // page sections
+      $("auth_card").classList.add("hidden");
+      $("app").classList.remove("hidden");
+
+      // focus composer
+      $("query").focus();
+    }
+
+    function showSignedOut() {
+      $("model_wrap").classList.add("hidden");
+      $("user_wrap").classList.add("hidden");
+      $("whoami").textContent = "";
+
+      $("auth_card").classList.remove("hidden");
+      $("app").classList.add("hidden");
+      session_token = null;
+    }
+
+    // autosize textarea (simple)
+    const autoSize = (ta) => {
+      ta.style.height = "auto";
+      ta.style.height = Math.min(ta.scrollHeight, 320) + "px";
+    };
+    $("query").addEventListener("input", (e) => autoSize(e.target));
+
+    // --- Auth: Sign in / out ---
+    $("signin").onclick = async () => {
+      const email = $("email").value.trim();
+      const password = $("password").value;
+      if (!email || !password) { alert("Enter email and password."); return; }
+
+      try {
+        console.log("login: calling /api/login");
+        const res = await fetch(`${api_base}/api/login`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ email, password })
+        });
+        const data = await res.json().catch(()=>({}));
+        if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`);
+
+        session_token = data.token;
+        console.log("login: ok");
+        showSignedIn(email);
+      } catch (e) {
+        console.error("login: failed", e);
+        alert("Sign-in failed: " + e.message);
+      }
+    };
+
+    $("logout").onclick = async () => {
+      try {
+        if (session_token) {
+          console.log("logout: calling /api/logout");
+          await fetch(`${api_base}/api/logout`, { method: "POST", headers: { "Authorization": `Bearer ${session_token}` } });
+        }
+      } catch (e) {
+        console.warn("logout: error", e);
+      } finally {
+        showSignedOut();
+      }
+    };
+
+    // --- Chat send (with AML guard + heartbeat + console logs) ---
+    async function sendChat(q) {
+      const reqId = crypto.randomUUID();
+      const started = Date.now();
+
+      addMsg(q, "user", false);
+      addMsg("Thinking…", "bot", false);
+
+      // Heartbeat: ping /api/health in background every 2s until done
+      let hbTimer = setInterval(async () => {
+        try {
+          const r = await fetch(`${api_base}/api/health`);
+          console.log(`[hb ${reqId}] health -> ${r.ok ? "ok" : r.status}`);
+        } catch (e) {
+          console.log(`[hb ${reqId}] health error`, e);
+        }
+      }, 2000);
+
+      const headers = { "Content-Type": "application/json", "X-Client-Request-ID": reqId };
+      if (session_token) headers["Authorization"] = `Bearer ${session_token}`;
+
+      // Abort after 300s
+      const ctrl = new AbortController();
+      const timeout = setTimeout(() => ctrl.abort("timeout"), 300000);
+
+      try {
+        console.log(`chat: POST /api/chat rid=${reqId}`);
+        const res = await fetch(`${api_base}/api/chat`, {
+          method: "POST",
+          headers, signal: ctrl.signal,
+          body: JSON.stringify({ query: q, top_k: 5, model: $("model").value })
+        });
+        const text = await res.text();
+        let data; try { data = JSON.parse(text); } catch { throw new Error(`Non-JSON (HTTP ${res.status}): ${text.slice(0,150)}`); }
+
+        const dt = Date.now() - started;
+        console.log(`chat: done ${res.status} in ${dt}ms rid=${res.headers.get("X-Request-ID") || reqId}`);
+
+        // Replace "Thinking..." bubble with markdown-rendered answer
+        chatEl.lastChild.querySelector(".msg") ? null : null; // no-op safeguard
+        chatEl.lastChild.remove(); // remove "Thinking…"
+        addMsg(data.answer || (data.detail || `HTTP ${res.status}`), "bot", true);
+        if (data.contexts) addContexts(data.contexts);
+      } catch (e) {
+        console.error("chat: error", e);
+        chatEl.lastChild.remove(); // remove "Thinking…"
+        addMsg("Error: " + (e.message || e), "bot", false);
+      } finally {
+        clearInterval(hbTimer);
+        clearTimeout(timeout);
+      }
+    }
+
+    // Submit handler
+    $("composer").addEventListener("submit", async (ev) => {
+      ev.preventDefault();
+      if (!session_token) { alert("Please sign in first."); return; }
+
+      const ta = $("query");
+      const q = (ta.value || "").trim();
+      if (!q) return;
+
+      // 8) Guard: block AML/money laundering queries
+      if (/\bAML\b/i.test(q) || /money\s+laundering/i.test(q)) {
+        addMsg("For now, this assistant is trained to answer **sanctions-related** queries only. Please rephrase your question accordingly.", "bot", true);
+        ta.value = ""; autoSize(ta); return;
+      }
+
+      ta.value = ""; autoSize(ta);
+      await sendChat(q);
+    });
+
+    // Enter to send (Shift+Enter for newline)
+    $("query").addEventListener("keydown", (e) => {
+      if (e.key === "Enter" && !e.shiftKey) {
+        e.preventDefault();
+        $("composer").dispatchEvent(new Event("submit"));
+      }
+    });
+  </script>
+</body>
+</html>
