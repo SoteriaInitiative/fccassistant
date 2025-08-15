@@ -19,12 +19,12 @@ MODEL_ID="2867371294100291584"
 MODEL_ENDPOINT_ID="1429685073992482816"
 MODEL_BASE="gemini-2.5-flash"
 ALLOWED_USER_PW="demo@example.com:P@ssw0Rd"
-SERVICE_APP_NAME="acams-ai"
+SERVICE_APP_NAME="acams-ai-agent"
 
 # Initial deployment of the app
-gcloud builds submit --tag gcr.io/$PROJECT_ID/ask-simons
-gcloud run deploy ask-simons \
-  --image gcr.io/$PROJECT_ID/ask-simons \
+gcloud builds submit --tag gcr.io/$PROJECT_ID/$SERVICE_APP_NAME
+gcloud run deploy $SERVICE_APP_NAME \
+  --image gcr.io/$PROJECT_ID/$SERVICE_APP_NAME \
   --platform managed \
   --region us-central1 \
   --min-instances=0 \
