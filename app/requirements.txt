@@ -1,8 +1,22 @@
-fastapi==0.111.0
-uvicorn[standard]==0.30.1
-google-cloud-storage==2.17.0
-google-cloud-aiplatform==1.66.0
-firebase-admin==6.5.0
-faiss-cpu==1.8.0.post1
-numpy==1.26.4
-python-dotenv==1.0.1
+# requirements.txt
+fastapi            # satisfies ADK >=0.115.0
+starlette           # matches FastAPI 0.115.x
+uvicorn[standard]
+pydantic            # compatible with FastAPI 0.115.x
+typing-extensions
+anyio
+
+# Vertex + ADK
+google-adk
+google-genai
+google-cloud-aiplatform  # satisfies ADK >=1.87.0
+
+# GCS + storage
+google-cloud-storage
+
+# App deps
+faiss-cpu
+numpy
+python-dotenv
+charset-normalizer
+firebase-admin

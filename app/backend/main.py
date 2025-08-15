@@ -1,326 +1,423 @@
-import os
-import json
-import time
-import threading
-import secrets
-import uuid
-import logging
-from typing import List, Dict, Any, Tuple, Optional
+# app/main.py
+import os, json, time, secrets, re
+from typing import Dict, Any, Optional, List
 
 import numpy as np
 import faiss
-from fastapi import FastAPI, Depends, HTTPException, Header, Request, Response
+import logging
+
+from fastapi import FastAPI, Request, HTTPException, Depends
 from fastapi.staticfiles import StaticFiles
+from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-from google.cloud import storage
+# Vertex / ADK
 from vertexai import init as vertexai_init
 from vertexai.language_models import TextEmbeddingModel
-from vertexai.preview.generative_models import GenerativeModel
+from vertexai.preview.reasoning_engines import AdkApp
+from google.adk.agents import Agent
 
-# ---------- Logging ----------
+from google.cloud import storage
+_storage_client: Optional[storage.Client] = None
+
 logging.basicConfig(level=logging.INFO)
-log = logging.getLogger("ask-simons")
+log = logging.getLogger("fcc-ai-agent")
 
-def _timer(name: str):
-    t0 = time.time()
-    def done(**extra):
-        dt_ms = round((time.time() - t0) * 1000, 1)
-        log.info("timing.%s", name, extra={"ms": dt_ms, **extra})
-    return done
+# ------------------------------
+# Env configuration (Cloud Run)
+# ------------------------------
+PROJECT_ID         = os.getenv("PROJECT_ID")
+LOCATION           = os.getenv("LOCATION", "us-central1")
+BASE_MODEL_NAME    = os.getenv("BASE_MODEL_NAME", "")  # publisher path or short; prefer full publisher path
+TUNED_MODEL_NAME   = os.getenv("TUNED_MODEL_NAME", "") # endpoint path when tuned, e.g.: projects/.../endpoints/...
+ROUTER_MODEL_NAME  = os.getenv("ROUTER_MODEL_NAME", f"projects/{PROJECT_ID}/locations/{LOCATION}/publishers/google/models/gemini-2.0-flash")
+GCS_FULL_PATH = os.getenv("GCS_PREFIX", "")
+parts = GCS_FULL_PATH.split('/')
+GCS_BUCKET         = parts[-2]
+GCS_PREFIX         = parts[-1]
+WORKDIR            = os.getenv("WORKDIR", "/workspace")  # folder that has embeddings/faiss/corpus
+ALLOW_CORS_ALL     = os.getenv("ALLOW_CORS_ALL", "1") == "1"
+ALLOWED_USERS      = os.getenv("ALLOWED_USERS", "")      # "email:pw,email2:pw2"
 
-# ---------- Config ----------
-PROJECT_ID = os.getenv("PROJECT_ID")
-LOCATION = os.getenv("LOCATION", "us-central1")
-BASE_MODEL_NAME = os.getenv("BASE_MODEL_NAME", "gemini-2.5-flash")
-TUNED_MODEL_NAME = os.getenv("TUNED_MODEL_NAME", "")
-GCS_PREFIX = os.getenv("GCS_PREFIX")
-ALLOW_CORS_ALL = os.getenv("ALLOW_CORS_ALL", "1") == "1"
+DECLINE_MESSAGE    = os.getenv("DECLINE_MESSAGE", "I can’t process non‑sanctions questions at the moment. This assistant is restricted to sanctions-related queries.")
 
-# ---------- Vertex init ----------
-if PROJECT_ID:
-    vertexai_init(project=PROJECT_ID, location=LOCATION)
+# Optional floor for sanctions top_k (set to 0 to disable)
+SANCTIONS_TOPK_FLOOR = int(os.getenv("SANCTIONS_TOPK_FLOOR", "5"))
 
-# Reuse models across requests (reduce per-call overhead)
-_EMB_MODEL = TextEmbeddingModel.from_pretrained("text-embedding-004")
-_GEN_BASE = GenerativeModel(BASE_MODEL_NAME)
-_GEN_TUNED = GenerativeModel(TUNED_MODEL_NAME) if TUNED_MODEL_NAME else None
+GCS_CACHE_DIR      = os.getenv("GCS_CACHE_DIR", "/tmp/fcc_cache")
+os.makedirs(GCS_CACHE_DIR, exist_ok=True)
 
-# ---------- Storage + index cache ----------
-_storage_client = None
-_index_lock = threading.Lock()
-_cached = {"index": None, "vecs": None, "meta": None, "raw": None, "loaded_at": 0.0}
+# ------------------------------
+# FastAPI app + CORS
+# ------------------------------
+app = FastAPI(title="FCC AI Assistant")
+
+if ALLOW_CORS_ALL == "1":
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"], allow_credentials=True,
+        allow_methods=["*"], allow_headers=["*"],
+    )
+
+# ------------------------------
+# Simple env-based auth
+# ------------------------------
+TOKENS: Dict[str, str] = {}  # token -> email
 
 def _get_storage() -> storage.Client:
     global _storage_client
     if _storage_client is None:
-        _storage_client = storage.Client()
+        _storage_client = storage.Client(project=PROJECT_ID) if PROJECT_ID else storage.Client()
     return _storage_client
 
-def _parse_gs(uri: str) -> Tuple[str, str]:
-    if not uri or not uri.startswith("gs://"):
-        raise ValueError("GCS_PREFIX must be a gs:// URI")
-    path = uri[5:]
-    bucket, *rest = path.split("/", 1)
-    prefix = rest[0] if rest else ""
-    return bucket, prefix.rstrip("/")
+def _gcs_key(name: str) -> str:
+    # Compose "prefix/name" if prefix present
+    return f"{GCS_PREFIX}/{name}" if GCS_PREFIX else name
 
-def _download_bytes(bucket: str, path: str) -> bytes:
-    client = _get_storage()
-    blob = client.bucket(bucket).blob(path)
-    return blob.download_as_bytes()
+def _ensure_local_from_gcs(name: str) -> str:
+    """
+    Ensure the given artifact (embeddings.npy, faiss.index, embeddings_meta.jsonl, corpus_chunks.jsonl)
+    exists locally under GCS_CACHE_DIR. If missing, download from gs://GCS_BUCKET/prefix/name.
+    Returns local path.
+    """
+    local_path = os.path.join(GCS_CACHE_DIR, name)
+    if os.path.exists(local_path):
+        return local_path
+    if not GCS_BUCKET:
+        # No bucket configured -> fallback to WORKDIR
+        fallback = os.path.join(WORKDIR, name)
+        if not os.path.exists(fallback):
+            raise FileNotFoundError(f"No GCS bucket and local file missing: {fallback}")
+        return fallback
 
-def _ensure_index_loaded():
-    with _index_lock:
-        if _cached["index"] is not None and (time.time() - _cached["loaded_at"] < 3600):
-            return
-        if not GCS_PREFIX:
-            raise RuntimeError("GCS_PREFIX env var must be set (gs://bucket/prefix)")
-        t = _timer("load_index")
-        bucket, prefix = _parse_gs(GCS_PREFIX)
-        paths = {
-            "emb": f"{prefix}/embeddings.npy",
-            "faiss": f"{prefix}/faiss.index",
-            "meta": f"{prefix}/embeddings_meta.jsonl",
-            "corpus": f"{prefix}/corpus_chunks.jsonl",
-        }
-        emb_bytes = _download_bytes(bucket, paths["emb"])
-        idx_bytes = _download_bytes(bucket, paths["faiss"])
-        meta_bytes = _download_bytes(bucket, paths["meta"])
-        corpus_bytes = _download_bytes(bucket, paths["corpus"])
+    bucket = _get_storage().bucket(GCS_BUCKET)
+    blob = bucket.blob(_gcs_key(name))
+    if not blob.exists():
+        raise FileNotFoundError(f"Blob not found in GCS: gs://{GCS_BUCKET}/{_gcs_key(name)}")
+    os.makedirs(os.path.dirname(local_path), exist_ok=True)
+    blob.download_to_filename(local_path)
+    return local_path
 
-        import io, tempfile
-        vecs = np.load(io.BytesIO(emb_bytes))
-        with tempfile.NamedTemporaryFile(suffix=".index") as tf:
-            tf.write(idx_bytes)
-            tf.flush()
-            index = faiss.read_index(tf.name)
-        faiss.normalize_L2(vecs)
+def _allowed_map() -> Dict[str, str]:
+    m = {}
+    s = ALLOWED_USERS.strip()
+    if not s:
+        return m
+    for pair in s.split(","):
+        if ":" in pair:
+            email, pw = pair.split(":", 1)
+            m[email.strip().lower()] = pw
+    return m
 
-        meta = [json.loads(l) for l in meta_bytes.decode("utf-8").splitlines() if l.strip()]
-        raw = {}
-        for line in corpus_bytes.decode("utf-8").splitlines():
-            if line.strip():
-                r = json.loads(line)
-                key = f'{r.get("doc")}:{r.get("chunk_id")}'
-                raw[key] = r.get("text", "")
+def _auth_email_from_token(token: Optional[str]) -> Optional[str]:
+    if not token: return None
+    return TOKENS.get(token)
 
-        _cached.update({"index": index, "vecs": vecs, "meta": meta, "raw": raw, "loaded_at": time.time()})
-        t(ntotal=int(index.ntotal))
+def _require_auth(request: Request) -> str:
+    # Bearer
+    auth = request.headers.get("Authorization", "")
+    email = None
+    if auth.lower().startswith("bearer "):
+        email = _auth_email_from_token(auth.split(" ", 1)[1].strip())
+    # or ?token= (for EventSource/SSE)
+    if not email:
+        token = request.query_params.get("token")
+        if token:
+            email = _auth_email_from_token(token)
+    # dev mode: if no users defined
+    if not email and not _allowed_map():
+        email = "dev@local"
+    if not email:
+        raise HTTPException(401, "Unauthorized")
+    return email
 
-# ---------- Models ----------
-class ChatRequest(BaseModel):
+# ------------------------------
+# RAG tool: FAISS retrieval
+# ------------------------------
+def load_index():
+    # ✨ now resolves from GCS (cached locally), or falls back to WORKDIR if no GCS configured
+    emb_path  = _ensure_local_from_gcs("embeddings.npy")
+    faiss_path = _ensure_local_from_gcs("faiss.index")
+    meta_path  = _ensure_local_from_gcs("embeddings_meta.jsonl")
+
+    vecs = np.load(emb_path)
+    index = faiss.read_index(faiss_path)
+
+    meta: List[Dict[str, Any]] = []
+    with open(meta_path, "r", encoding="utf-8") as f:
+        for line in f:
+            meta.append(json.loads(line))
+    return vecs, index, meta
+
+def embed_query(q: str):
+    model = TextEmbeddingModel.from_pretrained("text-embedding-004")
+    return model.get_embeddings([q])[0].values
+
+def retrieve(q: str, k: int = 5) -> List[str]:
+    _, index, meta = load_index()
+    qv = np.array(embed_query(q), dtype="float32")[None, :]
+    faiss.normalize_L2(qv)
+    _, idxs = index.search(qv, k)
+    # Load raw chunks
+    raw_path = _ensure_local_from_gcs("corpus_chunks.jsonl")
+    raw: Dict[str, str] = {}
+    with open(raw_path, "r", encoding="utf-8") as f:
+        for line in f:
+            r = json.loads(line)
+            raw[f'{r["doc"]}:{r["chunk_id"]}'] = r["text"]
+    contexts: List[str] = []
+    for i in idxs[0]:
+        h = meta[i]
+        key = f'{h["doc"]}:{h["chunk_id"]}'
+        contexts.append(raw.get(key, ""))
+    return contexts
+
+def search_index(query: str, top_k: int = 5) -> list[str]:
+    """ADK tool: Return up to top_k context chunks from local FAISS index."""
+    top_k = max(1, min(int(top_k or 5), 15))
+    return retrieve(query, k=top_k)
+
+# ------------------------------
+# Agents
+# ------------------------------
+SANCTIONS_INSTRUCTION = (
+    "You are an experienced US Sanctions Officer. "
+    "Use ONLY the context returned by the search_index tool. "
+    "If the answer is not fully supported by context, say you don't know."
+)
+
+GENERAL_INSTRUCTION = (
+    "You do not answer the question. Kindly decline to analyse the user question and explain you are not built for general use."
+)
+
+DOMAIN_PROFILES = {
+    "sanctions": {
+        "model": lambda use_tuned: (TUNED_MODEL_NAME if use_tuned and TUNED_MODEL_NAME else BASE_MODEL_NAME),
+        "instruction": SANCTIONS_INSTRUCTION,
+        "use_tool": True,
+    },
+    "general": {
+        "model": lambda _use: os.getenv("GENERAL_MODEL_NAME", ROUTER_MODEL_NAME),  # harmless default
+        "instruction": GENERAL_INSTRUCTION,
+        "use_tool": False,
+    },
+}
+
+def build_router_agent() -> Agent:
+    return Agent(
+        model=ROUTER_MODEL_NAME,
+        name="router",
+        instruction=(
+            "You are a strict router. Output ONLY JSON.\n"
+            "If the question mentions sanctions concepts (OFAC, SDN, 50% rule, blocking, FAQ 401, EU/UK/SECO), "
+            "set domain='sanctions'; else 'general'.\n"
+            "Rules:\n"
+            " - For domain='general', set top_k=0 and use_tuned=false.\n"
+            " - For domain='sanctions', choose a reasonable top_k (5..15).\n"
+            "Return JSON: {domain:'sanctions'|'general', top_k:5..15, use_tuned:bool, task:str}\n"
+            "Never include prose—JSON only."
+        ),
+    )
+
+def build_reasoner_agent_for(domain: str, use_tuned: bool) -> Agent:
+    prof = DOMAIN_PROFILES.get(domain, DOMAIN_PROFILES["general"])
+    model_name = prof["model"](use_tuned)
+    tools = [search_index] if prof["use_tool"] else []
+    return Agent(
+        model=model_name,
+        name=f"reasoner_{domain}",
+        tools=tools,
+        instruction=prof["instruction"],
+    )
+
+# ------------------------------
+# Schemas
+# ------------------------------
+class ChatIn(BaseModel):
     query: str
-    top_k: int | None = 5
-    model: str | None = "base"
+    top_k: Optional[int] = 5
+    model: Optional[str] = "base"   # "base" | "tuned" (hint; router may override)
 
-class ChatResponse(BaseModel):
-    answer: str
-    model_used: str
-    contexts: List[Dict[str, Any]]
-
-class LoginReq(BaseModel):
-    email: str
-    password: str
-
-class LoginResp(BaseModel):
-    token: str
-
-# ---------- Simple allowlist + sessions ----------
-def _load_allowed_users() -> Dict[str, str]:
-    raw = os.getenv("ALLOWED_USERS", "").strip()
-    users: Dict[str, str] = {}
-    if raw:
-        for pair in raw.split(","):
-            if ":" in pair:
-                email, pw = pair.split(":", 1)
-                users[email.strip().lower()] = pw.strip()
-    return users
-
-ALLOWED = _load_allowed_users()
-SESSIONS: Dict[str, Dict[str, Any]] = {}
-SESSION_TTL_SECONDS = int(os.getenv("SESSION_TTL_SECONDS", "7200"))  # 2h
-
-def _issue_token(email: str) -> str:
-    token = secrets.token_urlsafe(32)
-    SESSIONS[token] = {"email": email, "exp": time.time() + SESSION_TTL_SECONDS}
-    return token
-
-def _validate_token(authorization: Optional[str]) -> Dict[str, Any]:
-    if os.getenv("DISABLE_AUTH") == "1":
-        return {"email": "dev-user", "token": "dev"}
-    if not authorization or not authorization.lower().startswith("bearer "):
-        raise HTTPException(status_code=401, detail="Missing Bearer token")
-    token = authorization.split(" ", 1)[1].strip()
-    sess = SESSIONS.get(token)
-    if not sess:
-        raise HTTPException(status_code=401, detail="Invalid session")
-    if time.time() > float(sess["exp"]):
-        SESSIONS.pop(token, None)
-        raise HTTPException(status_code=401, detail="Session expired")
-    return {"email": sess["email"], "token": token}
-
-def verify_auth(authorization: Optional[str] = Header(None)):
-    return _validate_token(authorization)
-
-# ---------- RAG helpers with timing ----------
-def embed_query(text: str):
-    t = _timer("embed_query")
-    try:
-        return _EMB_MODEL.get_embeddings([text])[0].values
-    finally:
-        t(chars=len(text))
-
-def retrieve(query: str, k: int = 5):
-    t = _timer("retrieve")
-    try:
-        _ensure_index_loaded()
-        index = _cached["index"]
-        meta = _cached["meta"]
-        qv = np.array(embed_query(query), dtype="float32")[None, :]
-        faiss.normalize_L2(qv)
-        sims, idxs = index.search(qv, min(k, index.ntotal))
-        hits = []
-        for i, score in zip(idxs[0], sims[0]):
-            if i == -1:
-                continue
-            m = meta[i].copy()
-            m["_score"] = float(score)
-            hits.append(m)
-        return hits
-    finally:
-        ntotal = int(_cached["index"].ntotal) if _cached["index"] is not None else 0
-        t(k=k, index_ntotal=ntotal)
-
-
-def build_context(hits):
-    raw = _cached["raw"]
-    ctxs = []
-    for h in hits:
-        key = f'{h.get("doc")}:{h.get("chunk_id")}'
-        ctxs.append({
-            "doc": h.get("doc"),
-            "chunk_id": h.get("chunk_id"),
-            "text": raw.get(key, ""),
-            "score": h.get("_score", 0.0),
-        })
-    return ctxs
-
-
-def generate_answer(query: str, contexts, use_tuned: bool):
-    t = _timer("generate_answer")
-    model_name = TUNED_MODEL_NAME if (use_tuned and TUNED_MODEL_NAME) else BASE_MODEL_NAME
-    model = _GEN_TUNED if (use_tuned and _GEN_TUNED) else _GEN_BASE
-    ctx_text = "\n---\n".join(c["text"] for c in contexts if c.get("text"))
-    prompt = (
-        "You are an experienced US Sanctions Officer. Answer the question strictly using the provided context. "
-        "If the answer is not fully supported by context, say you don't know.\n\n"
-        f"Context:\n{ctx_text}\n\nQuestion: {query}"
-    )
-    try:
-        log.info("vertex.request", extra={"model": model_name, "prompt_chars": len(prompt), "ctx_chars": len(ctx_text), "q_chars": len(query)})
-        resp = model.generate_content(prompt)
-        answer = getattr(resp, "text", "").strip() or "I'm not sure."
-        return answer, model_name
-    finally:
-        t(model=model_name)
-
-# ---------- FastAPI app ----------
-app = FastAPI(title="Ask Simons - FCC Assistant MVP")
-
-# CORS for non-same-origin testing
-if ALLOW_CORS_ALL:
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=["*"],
-        allow_credentials=True,
-        allow_methods=["*"],
-        allow_headers=["*"],
-    )
-
-# Request logging middleware (request IDs, timings)
-@app.middleware("http")
-async def log_requests(request: Request, call_next):
-    rid = request.headers.get("X-Client-Request-ID") or str(uuid.uuid4())
-    t0 = time.time()
-    path = request.url.path
-    method = request.method
-    try:
-        log.info("api.request", extra={"rid": rid, "method": method, "path": path})
-        response: Response = await call_next(request)
-        dt = round((time.time() - t0) * 1000, 1)
-        response.headers["X-Request-ID"] = rid
-        log.info("api.response", extra={"rid": rid, "method": method, "path": path, "status": response.status_code, "ms": dt})
-        return response
-    except Exception as e:
-        dt = round((time.time() - t0) * 1000, 1)
-        log.exception("api.error", extra={"rid": rid, "method": method, "path": path, "ms": dt})
-        # Preserve JSON error shape for clients
-        return Response(
-            content=json.dumps({"detail": f"Internal error: {str(e)}", "request_id": rid}),
-            status_code=500,
-            media_type="application/json",
-            headers={"X-Request-ID": rid},
-        )
-
-# ---------- Startup warm-up (so first user is faster) ----------
-@app.on_event("startup")
-def _warm():
-    log.info("startup.begin")
-    try:
-        _ensure_index_loaded()
-        # Touch models once
-        _ = _EMB_MODEL.get_embeddings(["warmup"])[0].values
-        _ = _GEN_BASE.generate_content("warmup")
-        if _GEN_TUNED:
-            _ = _GEN_TUNED.generate_content("warmup")
-        log.info("startup.done")
-    except Exception as e:
-        log.exception("startup.error")
-        # Don’t crash; health endpoint will reflect readiness issues
-
-# ---------- Health ----------
+# ------------------------------
+# Health & Auth
+# ------------------------------
 @app.get("/api/health")
 def health():
-    try:
-        _ensure_index_loaded()
-        return {"ok": True, "index_size": int(_cached["index"].ntotal)}
-    except Exception as e:
-        return {"ok": False, "error": str(e)}
+    return {"ok": True, "ts": int(time.time())}
 
-# ---------- Auth endpoints ----------
-@app.post("/api/login", response_model=LoginResp)
-def login(req: LoginReq):
-    email = (req.email or "").strip().lower()
-    pw = (req.password or "")
-    if not email or not pw:
-        raise HTTPException(status_code=400, detail="Email and password required")
-    allowed_pw = _load_allowed_users().get(email)  # reload to pick up new env (optional)
-    if not allowed_pw or allowed_pw != pw:
-        raise HTTPException(status_code=401, detail="Invalid credentials or not authorized")
-    token = _issue_token(email)
-    log.info("auth.login", extra={"email": email})
-    return LoginResp(token=token)
+@app.post("/api/login")
+def login(payload: Dict[str, str]):
+    email = (payload.get("email") or "").strip().lower()
+    pw = payload.get("password") or ""
+    allowed = _allowed_map()
+    if allowed:
+        if email not in allowed or allowed[email] != pw:
+            raise HTTPException(401, "Invalid credentials")
+    token = secrets.token_urlsafe(24)
+    TOKENS[token] = email or "dev@local"
+    return {"token": token}
 
 @app.post("/api/logout")
-def logout(user=Depends(verify_auth)):
-    SESSIONS.pop(user["token"], None)
-    log.info("auth.logout", extra={"email": user["email"]})
+def logout(request: Request):
+    token = None
+    auth = request.headers.get("Authorization", "")
+    if auth.lower().startswith("bearer "):
+        token = auth.split(" ", 1)[1].strip()
+    token = token or request.query_params.get("token")
+    if token and token in TOKENS:
+        TOKENS.pop(token, None)
     return {"ok": True}
 
-# ---------- Chat ----------
-@app.post("/api/chat", response_model=ChatResponse)
-def chat(req: ChatRequest, user=Depends(verify_auth)):
-    if not req.query or not req.query.strip():
-        raise HTTPException(status_code=400, detail="Query is required")
-    top_k = max(1, min(int(req.top_k or 5), 20))
-    log.info("chat.begin", extra={"email": user.get("email"), "top_k": top_k, "model": req.model, "q_chars": len(req.query)})
-    hits = retrieve(req.query, top_k)
-    ctxs = build_context(hits)
-    ans, used = generate_answer(req.query, ctxs, use_tuned=(req.model == "tuned"))
-    log.info("chat.end", extra={"email": user.get("email"), "model_used": used, "ctxs": len(ctxs), "ans_chars": len(ans)})
-    return ChatResponse(answer=ans, model_used=used, contexts=ctxs)
+# ------------------------------
+# Non-streaming final JSON endpoint (back-compat)
+# ------------------------------
+@app.post("/api/chat")
+def chat(payload: ChatIn, request: Request, email: str = Depends(_require_auth)):
+    vertexai_init(project=PROJECT_ID, location=LOCATION)
 
-# ---------- Static frontend ----------
+    # 1) Router (non-streaming)
+    router_app = AdkApp(agent=build_router_agent())
+    router_text = ""
+    for ev in router_app.stream_query(user_id=email, message=f"User question:\n{payload.query}\n\nJSON only:"):
+        parts = (ev.get("content") or {}).get("parts", [])
+        for p in parts:
+            if "text" in p: router_text += p["text"]
+
+    # Parse robustly (strip code fences if present)
+    try:
+        rt = router_text.strip()
+        if rt.startswith("```"):
+            rt = "\n".join(line for line in rt.splitlines() if not line.strip().startswith("```"))
+        if not (rt.startswith("{") and rt.endswith("}")):
+            m = re.search(r"\{[\s\S]*\}", rt)
+            if m: rt = m.group(0)
+        plan = json.loads(rt or "{}")
+    except Exception:
+        plan = {}
+
+    domain = (plan.get("domain") or "general").strip().lower()
+    try:
+        k = int(plan.get("top_k", payload.top_k or 10))
+    except Exception:
+        k = payload.top_k or 10
+    k = max(0, min(k, 10))
+    if domain == "sanctions" and SANCTIONS_TOPK_FLOOR > 0 and k < SANCTIONS_TOPK_FLOOR:
+        k = SANCTIONS_TOPK_FLOOR
+    if domain != "sanctions":
+        # General path: do not reason; just return decline
+        return {"answer": DECLINE_MESSAGE, "contexts": []}
+
+    use_tuned = bool(plan.get("use_tuned", payload.model == "tuned"))
+    task = (plan.get("task") or payload.query).strip()
+
+    # 2) Reasoner (non-streaming)
+    agent = build_reasoner_agent_for(domain, use_tuned)
+    app_agent = AdkApp(agent=agent)
+    if DOMAIN_PROFILES["sanctions"]["use_tool"] and k > 0:
+        prompt = (
+            f"Use search_index(query='{payload.query}', top_k={k}) to fetch context.\n"
+            f"Then answer the task: {task}\n"
+            f"Respond strictly based on retrieved context. If unsupported, say you don't know."
+        )
+    else:
+        prompt = f"Task: {task}\nRespond strictly based on retrieved context. If unsupported, say you don't know."
+
+    final_answer = ""
+    for ev in app_agent.stream_query(user_id=email, message=prompt):
+        parts = (ev.get("content") or {}).get("parts", [])
+        for p in parts:
+            if "text" in p: final_answer += p["text"]
+
+    return {"answer": (final_answer or "").strip(), "contexts": []}
+
+# ------------------------------
+# Streaming SSE endpoint (/api/chat/stream)
+# ------------------------------
+def sse(event: str, data: dict) -> bytes:
+    return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n".encode("utf-8")
+
+@app.get("/api/chat/stream")
+async def chat_stream(request: Request, q: str, top_k: int = 5, model: str = "base", token: str = "", rid: str = ""):
+    email = _require_auth(request)
+    vertexai_init(project=PROJECT_ID, location=LOCATION)
+
+    async def gen():
+        # 1) Router
+        router_app = AdkApp(agent=build_router_agent())
+        router_text = ""
+        for ev in router_app.stream_query(user_id=email, message=f"User question:\n{q}\n\nJSON only:"):
+            parts = (ev.get("content") or {}).get("parts", [])
+            for p in parts:
+                if "text" in p:
+                    router_text += p["text"]
+
+        # Robust parse
+        plan = {}
+        try:
+            rt = router_text.strip()
+            if rt.startswith("```"):
+                rt = "\n".join(line for line in rt.splitlines() if not line.strip().startswith("```"))
+            if not (rt.startswith("{") and rt.endswith("}")):
+                m = re.search(r"\{[\s\S]*\}", rt)
+                if m: rt = m.group(0)
+            plan = json.loads(rt or "{}")
+        except Exception:
+            plan = {}
+
+        domain = (plan.get("domain") or "general").strip().lower()
+        try:
+            k = int(plan.get("top_k", top_k or 10))
+        except Exception:
+            k = top_k or 5
+        k = max(0, min(k, 10))
+        if domain == "sanctions" and SANCTIONS_TOPK_FLOOR > 0 and k < SANCTIONS_TOPK_FLOOR:
+            k = SANCTIONS_TOPK_FLOOR
+
+        if domain != "sanctions":
+            # general → do not reason; return a final decline
+            yield sse("route", {"domain": domain, "top_k": 0, "use_tuned": False, "task": plan.get("task", q), "model": None})
+            yield sse("final", {"answer": DECLINE_MESSAGE})
+            return
+
+        use_tuned = bool(plan.get("use_tuned", model == "tuned"))
+        task = (plan.get("task") or q).strip()
+
+        agent = build_reasoner_agent_for(domain, use_tuned)
+        yield sse("route", {"domain": domain, "top_k": k, "use_tuned": use_tuned, "task": task, "model": agent.model})
+
+        # 2) Reasoner
+        app_agent = AdkApp(agent=agent)
+        if DOMAIN_PROFILES["sanctions"]["use_tool"] and k > 0:
+            prompt = (
+                f"Use search_index(query='{q}', top_k={k}) to fetch context.\n"
+                f"Then answer the task: {task}\n"
+                f"Respond strictly based on retrieved context. If unsupported, say you don't know."
+            )
+        else:
+            prompt = f"Task: {task}\nRespond strictly based on retrieved context. If unsupported, say you don't know."
+
+        answer_buf: List[str] = []
+        for ev in app_agent.stream_query(user_id=email, message=prompt):
+            parts = (ev.get("content") or {}).get("parts", [])
+            for p in parts:
+                if "function_call" in p:
+                    yield sse("retrieve", {
+                        "tool": p["function_call"].get("name", "search_index"),
+                        "args": p["function_call"].get("args", {})
+                    })
+                if "text" in p:
+                    chunk = p["text"]
+                    answer_buf.append(chunk)
+                    yield sse("delta", {"text": chunk})
+        yield sse("final", {"answer": "".join(answer_buf).strip()})
+
+    headers = {
+        "Cache-Control": "no-cache",
+        "Content-Type": "text/event-stream",
+        "Connection": "keep-alive",
+        "X-Accel-Buffering": "no",
+    }
+    return StreamingResponse(gen(), headers=headers)
+
 app.mount("/", StaticFiles(directory="frontend", html=True), name="static")
