@@ -19,6 +19,9 @@ profile="${profile:-FCCAssistant}"
 params_file="${params_file:-./params.json}"
 LOCAL_ARTIFACT_DIR="${artifacts_local_dir:-artifacts}"
 LOCAL_TEMPLATES_DIR="${templates_local_dir:-templates}"
+# Pre-chunk corpus bucket/prefix for Bedrock KB (when using pre-chunked files)
+corpus_s3_bucket="${corpus_s3_bucket:-ofac-rag-corpus}"
+corpus_prefix="${corpus_prefix:-corpus}"
 
 echo "[*] Verifying deployment parameters..."
 echo "[X] Profile Name: ${profile}"
@@ -199,6 +202,29 @@ main() {
   fi
   aws s3 cp ./$source_doc_local_dir s3://$source_docs_s3_bucket --recursive --recursive --exclude "*" --include "*.pdf" --region $region --profile $profile
 
+  # Create corpus bucket for pre-chunked files and run chunker in AWS mode
+  echo "Creating corpus storage for pre-chunked files: s3://$corpus_s3_bucket"
+  if ! aws --region "${region}" --profile "${profile}" s3api head-bucket --bucket "${corpus_s3_bucket}" >/dev/null 2>&1; then
+    if [[ "${region}" == "us-east-1" ]]; then
+      aws s3api create-bucket --bucket "$corpus_s3_bucket" --region "$region" --profile "$profile"
+    else
+      aws s3api create-bucket --bucket "$corpus_s3_bucket" --region "$region" --profile "$profile" --create-bucket-configuration LocationConstraint="$region"
+    fi
+  else
+    log "Corpus bucket already exists: ${corpus_s3_bucket}"
+  fi
+  echo "Running pdf_ingest in AWS mode to produce pre-chunked .txt files"
+  AWS_PROFILE="$profile" AWS_REGION="$region" python -m model.pdf_ingest aws \
+    --aws-input-bucket "$source_docs_s3_bucket" \
+    --aws-input-prefix "" \
+    --aws-output-bucket "$corpus_s3_bucket" \
+    --aws-output-prefix "$corpus_prefix" \
+    --aws-region "$region" \
+    --aws-profile "$profile" \
+    --upload-mode files
+
+  echo "NOTE: To have KB ingest pre-chunked files, set Q01pInputBucketName to '$corpus_s3_bucket' and Q04pChunkingStrategy to 'No chunking' in params.json before stack creation."
+
   echo "Validating template: $template_s3_url"
   aws cloudformation validate-template \
     --template-url "$template_s3_url" \
@@ -233,4 +259,3 @@ main() {
 }
 
 main "$@"
-

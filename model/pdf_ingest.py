@@ -1,4 +1,4 @@
-import os, io, json, re
+import os, io, json, re, argparse, sys
 from pathlib import Path
 from typing import List, Dict, Tuple, Optional
 
@@ -283,6 +283,44 @@ def download_blob(bucket_name: str, blob_name: str, dest_path: str):
     blob = client.bucket(bucket_name).blob(blob_name)
     blob.download_to_filename(dest_path)
 
+# -------------------------------
+# AWS S3 utilities (optional)
+# -------------------------------
+def s3_session(profile: Optional[str] = None, region: Optional[str] = None):
+    import boto3  # lazy import, only when needed
+    return boto3.Session(profile_name=profile, region_name=region) if (profile or region) else boto3.Session()
+
+def s3_client(session=None):
+    session = session or s3_session()
+    return session.client("s3")
+
+def s3_list_objects(bucket_name: str, prefix: str, session=None) -> List[str]:
+    s3 = s3_client(session)
+    keys: List[str] = []
+    kwargs = {"Bucket": bucket_name}
+    if prefix:
+        kwargs["Prefix"] = prefix
+    while True:
+        resp = s3.list_objects_v2(**kwargs)
+        for it in resp.get("Contents", []):
+            k = it["Key"]
+            if not k.endswith("/"):
+                keys.append(k)
+        token = resp.get("NextContinuationToken")
+        if not token:
+            break
+        kwargs["ContinuationToken"] = token
+    return keys
+
+def s3_download_blob(bucket_name: str, key: str, dest_path: str, session=None):
+    os.makedirs(os.path.dirname(dest_path), exist_ok=True)
+    s3 = s3_client(session)
+    s3.download_file(bucket_name, key, dest_path)
+
+def s3_upload_text(bucket_name: str, key: str, text: str, content_type: str = "text/plain; charset=utf-8", session=None):
+    s3 = s3_client(session)
+    s3.put_object(Bucket=bucket_name, Key=key, Body=text.encode("utf-8"), ContentType=content_type)
+
 def extract_text_generic(local_path: str, blob_name: str) -> str:
     name = blob_name.lower()
     if name.endswith(".pdf"):
@@ -327,7 +365,85 @@ def chunk_text(txt: str, size: int = 1200, overlap: int = 150, source: Optional[
 # -------------------------------
 # Driver
 # -------------------------------
-def main():
+def _safe_key_component(s: str) -> str:
+    return re.sub(r"[^A-Za-z0-9._\-/]+", "_", s)
+
+def _aws_mode_ingest_and_upload(
+    input_bucket: str,
+    input_prefix: str,
+    output_bucket: Optional[str],
+    output_prefix: str,
+    write_jsonl_locally: bool = True,
+    upload_mode: str = "files",  # files|jsonl|both
+    aws_profile: Optional[str] = None,
+    aws_region: Optional[str] = None,
+):
+    os.makedirs(WORKDIR, exist_ok=True)
+    session = s3_session(profile=aws_profile, region=aws_region)
+    try:
+        keys = s3_list_objects(input_bucket, input_prefix, session=session)
+    except Exception as e:
+        raise SystemExit(
+            f"❌ Unable to list objects in s3://{input_bucket}/{input_prefix} — {e}.\n"
+            f"Ensure the credentials (profile={aws_profile or 'default'}) have s3:ListBucket and the bucket policy allows it."
+        )
+    if not keys:
+        print(f"No objects found under s3://{input_bucket}/{input_prefix}")
+        return
+    corpus_jsonl = os.path.join(WORKDIR, "corpus_chunks.jsonl")
+    out = open(corpus_jsonl, "w", encoding="utf-8") if write_jsonl_locally or upload_mode in ("jsonl", "both") else None
+    for key in tqdm(keys, desc="S3 download + chunk"):
+        local_path = os.path.join(WORKDIR, key.replace("/", "_"))
+        s3_download_blob(input_bucket, key, local_path, session=session)
+        text = extract_text_generic(local_path, key)
+        if not text.strip():
+            continue
+        chunks = chunk_text(text, CHUNK_SIZE, CHUNK_OVERLAP)
+        if out:
+            for idx, ch in enumerate(chunks):
+                out.write(json.dumps({"doc": key, "chunk_id": idx, "text": ch}, ensure_ascii=False) + "\n")
+        if output_bucket and upload_mode in ("files", "both"):
+            doc_dir = _safe_key_component(key)
+            for idx, ch in enumerate(chunks):
+                fname = f"chunk-{idx:05d}.txt"
+                s3_key = "/".join([p for p in [output_prefix.strip("/"), "chunks", doc_dir, fname] if p])
+                s3_upload_text(output_bucket, s3_key, ch, session=session)
+    if out:
+        out.close()
+    if output_bucket and upload_mode in ("jsonl", "both"):
+        s3_key = "/".join([p for p in [output_prefix.strip("/"), "index", "corpus_chunks.jsonl"] if p])
+        with open(corpus_jsonl, "r", encoding="utf-8") as f:
+            s3_upload_text(output_bucket, s3_key, f.read(), content_type="application/jsonl", session=session)
+    print("✅ AWS ingest complete")
+
+def main(argv: Optional[List[str]] = None):
+    parser = argparse.ArgumentParser(description="Chunk documents and emit corpus_chunks.jsonl or upload chunks to S3")
+    parser.add_argument("provider", nargs="?", default="gcp", choices=["gcp", "aws"], help="Storage provider (default: gcp)")
+    parser.add_argument("--aws-input-bucket", dest="aws_input_bucket", help="S3 bucket for source documents")
+    parser.add_argument("--aws-input-prefix", dest="aws_input_prefix", default="", help="S3 prefix for source documents")
+    parser.add_argument("--aws-output-bucket", dest="aws_output_bucket", default=None, help="S3 bucket to upload pre-chunked files/jsonl")
+    parser.add_argument("--aws-output-prefix", dest="aws_output_prefix", default="", help="S3 prefix for uploads (e.g., chunks/)")
+    parser.add_argument("--upload-mode", dest="upload_mode", choices=["files", "jsonl", "both"], default="files", help="Upload mode when provider=aws")
+    parser.add_argument("--aws-region", dest="aws_region", default=None, help="AWS region for S3 operations")
+    parser.add_argument("--aws-profile", dest="aws_profile", default=None, help="AWS profile for credentials")
+    args = parser.parse_args(argv)
+
+    if args.provider == "aws":
+        if not args.aws_input_bucket:
+            raise SystemExit("❌ --aws-input-bucket is required for provider=aws")
+        _aws_mode_ingest_and_upload(
+            input_bucket=args.aws_input_bucket,
+            input_prefix=args.aws_input_prefix or "",
+            output_bucket=args.aws_output_bucket,
+            output_prefix=args.aws_output_prefix or "",
+            write_jsonl_locally=True,
+            upload_mode=args.upload_mode,
+            aws_profile=args.aws_profile,
+            aws_region=args.aws_region,
+        )
+        return
+
+    # Default: GCP path (unchanged behavior)
     os.makedirs(WORKDIR, exist_ok=True)
     bucket_name, src_prefix = _resolve_source()
     keys = list_objects(bucket_name, src_prefix)
