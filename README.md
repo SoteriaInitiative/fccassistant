@@ -33,13 +33,13 @@ For a web based chat app see further below.
 
 Set the initial environment parameters - do replace with your own!
 ```bash
-export GCP_ACCOUNT="YOUR_GCP_EMAIL@gmail.com"
-export PROJECT_ID="YOUR_PROJECT_ID"
-export PROJECT_NUM="YOUR_PROJECT_NUMBER"
-export GCS_PREFIX="gs://YOUR_GCS_BUCKET/index"
-export SA_EMAIL="YOUT_PROJECT_ID-compute@developer.gserviceaccount.com"
-export REGION="YOUR_REGION"
-export BUCKET="gs://YOUR_GCS_BUCKET"
+export GCP_ACCOUNT="fccassistant27@gmail.com"
+export PROJECT_ID="fcc-assistant-mvp"
+export PROJECT_NUM="526463352197"
+export GCS_PREFIX="gs://fcc-assistant-84/index"
+export SA_EMAIL="526463352197-compute@developer.gserviceaccount.com"
+export REGION="us-central1"
+export BUCKET="gs://fcc-assistant-84"
 ```
 
 Initiate the local environment - NOTE: Check ``setup.sh`` for any local settings you may need!
@@ -80,15 +80,15 @@ gcloud ai endpoints list --region=$REGION
 
 When you have obtained the values update the below and export the parameters.
 ```bash
-export MODEL_ID="YOUR_MODEL_ID"
-export MODEL_ENDPOINT_ID="YOUR_ENDPOINT_ID"
+export MODEL_ID="2867371294100291584"
+export MODEL_ENDPOINT_ID="1429685073992482816"
 ```
 
 Set the application parameters - NOTE: replace with your own!
 ```bash
 export MODEL_BASE="gemini-2.5-flash"
-export ALLOWED_USER_PW="USER@DOMAIN.com:PASSWORD"
-export SERVICE_APP_NAME="YOUR-SERVICE-NAME"
+export ALLOWED_USER_PW="demo@example.com:P@ssw0Rd"
+export SERVICE_APP_NAME="acams-ai-agent"
 ```
 
 Initial deployment of the app. Define your runtime capacity (compute/memory) as required.

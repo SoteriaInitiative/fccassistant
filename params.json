@@ -1,0 +1,8 @@
+[
+  { "ParameterKey": "Q01pInputBucketName",                "ParameterValue": "ofac-rag-docs" },
+  { "ParameterKey": "Q02pInputDocumentUploadFolderPrefix","ParameterValue": ""},
+  { "ParameterKey": "Q04pChunkingStrategy",               "ParameterValue": "Fixed-size chunking" },
+  { "ParameterKey": "Q05pMaxTokens",                      "ParameterValue": "300" },
+  { "ParameterKey": "Q06pOverlapPercentage",              "ParameterValue": "12" }
+]
+
