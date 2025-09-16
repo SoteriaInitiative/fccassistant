@@ -22,6 +22,9 @@ LOCAL_TEMPLATES_DIR="${templates_local_dir:-templates}"
 # Pre-chunk corpus bucket/prefix for Bedrock KB (when using pre-chunked files)
 corpus_s3_bucket="${corpus_s3_bucket:-ofac-rag-corpus}"
 corpus_prefix="${corpus_prefix:-corpus}"
+# Tuning bucket/prefix for SFT assets
+tuning_s3_bucket="${tuning_s3_bucket:-ofac-tuning}"
+tuning_prefix="${tuning_prefix:-tuning}"
 
 echo "[*] Verifying deployment parameters..."
 echo "[X] Profile Name: ${profile}"
@@ -256,6 +259,68 @@ main() {
     --profile "$profile"
 
   start_ingestion_jobs "$stack_name"
+
+  # -----------------------
+  # Supervised fine-tuning
+  # -----------------------
+  echo "Creating tuning storage bucket: s3://$tuning_s3_bucket"
+  if ! aws --region "${region}" --profile "${profile}" s3api head-bucket --bucket "${tuning_s3_bucket}" >/dev/null 2>&1; then
+    if [[ "${region}" == "us-east-1" ]]; then
+      aws s3api create-bucket --bucket "$tuning_s3_bucket" --region "$region" --profile "$profile"
+    else
+      aws s3api create-bucket --bucket "$tuning_s3_bucket" --region "$region" --profile "$profile" --create-bucket-configuration LocationConstraint="$region"
+    fi
+  else
+    log "Tuning bucket already exists: ${tuning_s3_bucket}"
+  fi
+
+  echo "Generating tuning data (JSONL) and uploading to s3://$tuning_s3_bucket/$tuning_prefix"
+  AWS_PROFILE="$profile" AWS_REGION="$region" python -m model.generate_tuning_data aws \
+    --aws-output-bucket "$tuning_s3_bucket" \
+    --aws-output-prefix "$tuning_prefix" \
+    --aws-region "$region" \
+    --aws-profile "$profile"
+
+  echo "Creating the Bedrock service role for supervised fine tuning (SFT) job execution"
+  SFT_ROLE_NAME="ofac-bedrock-sft-role"
+  SFT_POLICY_NAME="SFTAccess"
+  TRUST=$(jq -n --arg acct "$ACCOUNT_ID" --arg region "$region" '{Version:"2012-10-17",Statement:
+  [{Effect:"Allow",Principal:{Service:"bedrock.amazonaws.com"},Action:"sts:AssumeRole",Condition:{StringEquals:{"aws:SourceAccount":$acct},ArnLike:{"aws:SourceArn":
+  ("arn:aws:bedrock:"+$region+":"+$acct+":model-customization-job/*")}}}]}');
+  POLICY=$(jq -n --arg b "$tuning_s3_bucket" --arg p "$tuning_prefix" '{Version:"2012-10-17",Statement:[{Effect:"Allow",Action:["s3:ListBucket"],Resource:("arn:aws:s3:::"+$b),Condition:{StringLike:{"s3:prefix":[($p+"/*"),$p]}}},{Effect:"Allow",Action:
+  ["s3:GetObject"],Resource:("arn:aws:s3:::"+$b+"/"+$p+"/*")},{Effect:"Allow",Action:["s3:PutObject"],Resource:("arn:aws:s3:::"+$b+"/"+$p+"/outputs/*")}]}');
+  aws iam create-role --role-name "$SFT_ROLE_NAME" \
+    --assume-role-policy-document "$TRUST" \
+    --description "Bedrock SFT role" \
+    --profile "$profile" --region "$region" >/dev/null
+  aws iam put-role-policy --role-name "$SFT_ROLE_NAME" \
+    --policy-name "$SFT_POLICY_NAME" \
+    --policy-document "$POLICY" \
+    --profile "$profile" --region "$region"
+  echo "SFT Role created: ${SFT_ROLE_NAME} with:"
+  echo "ROLE POLICY:$TRUST"
+  echo "ACCESS POLICY: $POLICY"
+
+  echo "Waiting role creation..."
+  aws iam wait role-exists --role-name "$SFT_ROLE_NAME" --profile "$profile" --region "$region"
+  sleep 20
+
+  echo "Submitting Bedrock SFT job (adjust base model and role ARN as needed)"
+  TRAINING_URI="s3://${tuning_s3_bucket}/${tuning_prefix}/tuning_dataset_contents.jsonl"
+  OUTPUT_URI="s3://${tuning_s3_bucket}/${tuning_prefix}/outputs/"
+  JOB_NAME="ofac-sft-$(date +%Y%m%d-%H%M%S)"
+  CUSTOM_MODEL_NAME="ofac-nova-custom-$(date +%Y%m%d)"
+  BASE_MODEL_ID="amazon.nova-micro-v1:0:128k"
+  BEDROCK_SFT_ROLE_ARN="arn:aws:iam::${ACCOUNT_ID}:role/${SFT_ROLE_NAME}"
+  AWS_PROFILE="$profile" AWS_REGION="$region" python -m model.tune_nova \
+    --job-name "$JOB_NAME" \
+    --custom-model-name "$CUSTOM_MODEL_NAME" \
+    --role-arn "$BEDROCK_SFT_ROLE_ARN" \
+    --base-model-id "$BASE_MODEL_ID" \
+    --training-s3-uri "$TRAINING_URI" \
+    --output-s3-uri "$OUTPUT_URI" \
+    --region "$region" \
+    --profile "$profile"
 }
 
 main "$@"
