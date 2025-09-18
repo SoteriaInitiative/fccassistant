@@ -17,6 +17,7 @@ from vertexai import init as vertexai_init
 from vertexai.language_models import TextEmbeddingModel
 from vertexai.preview.reasoning_engines import AdkApp
 from google.adk.agents import Agent
+import boto3
 
 from google.cloud import storage
 _storage_client: Optional[storage.Client] = None
@@ -39,6 +40,13 @@ GCS_PREFIX         = parts[-1]
 WORKDIR            = os.getenv("WORKDIR", "/workspace")  # folder that has embeddings/faiss/corpus
 ALLOW_CORS_ALL     = os.getenv("ALLOW_CORS_ALL", "1") == "1"
 ALLOWED_USERS      = os.getenv("ALLOWED_USERS", "")      # "email:pw,email2:pw2"
+
+# AWS Bedrock (optional) — if enabled, the app uses Bedrock KB RAG instead of Vertex + local FAISS
+AWS_BEDROCK_MODE   = os.getenv("AWS_BEDROCK_MODE", "0").lower() in ("1", "true", "yes")
+AWS_REGION         = os.getenv("AWS_REGION", os.getenv("AWS_DEFAULT_REGION", "us-east-1"))
+BEDROCK_KB_ID      = os.getenv("BEDROCK_KB_ID", "")
+BEDROCK_MODEL_ARN  = os.getenv("BEDROCK_MODEL_ARN", "")  # use PT ARN if available
+BEDROCK_BASE_MODEL_ID = os.getenv("BEDROCK_BASE_MODEL_ID", "amazon.nova-micro-v1:0")
 
 DECLINE_MESSAGE    = os.getenv("DECLINE_MESSAGE", "I can’t process non‑sanctions questions at the moment. This assistant is restricted to sanctions-related queries.")
 
@@ -179,6 +187,34 @@ def search_index(query: str, top_k: int = 5) -> list[str]:
     return retrieve(query, k=top_k)
 
 # ------------------------------
+# AWS Bedrock KB RAG helpers
+# ------------------------------
+def _bedrock_model_arn() -> str:
+    if BEDROCK_MODEL_ARN:
+        return BEDROCK_MODEL_ARN
+    return f"arn:aws:bedrock:{AWS_REGION}::foundation-model/{BEDROCK_BASE_MODEL_ID}"
+
+def bedrock_retrieve_and_generate(question: str, top_k: int = 5) -> str:
+    """Call Bedrock KB retrieve-and-generate using KB ID and model ARN from env."""
+    if not BEDROCK_KB_ID:
+        raise HTTPException(500, "BEDROCK_KB_ID not configured for AWS mode")
+    client = boto3.client("bedrock-agent-runtime", region_name=AWS_REGION)
+    cfg = {
+        "vectorSearchConfiguration": {
+            "numberOfResults": max(1, min(int(top_k or 5), 15))
+        }
+    }
+    req = {
+        "knowledgeBaseId": BEDROCK_KB_ID,
+        "modelArn": _bedrock_model_arn(),
+        "retrievalQuery": {"text": question},
+        "retrievalConfiguration": cfg,
+    }
+    resp = client.retrieve_and_generate(**req)
+    out = resp.get("output", {}).get("text") or ""
+    return out.strip()
+
+# ------------------------------
 # Agents
 # ------------------------------
 SANCTIONS_INSTRUCTION = (
@@ -274,6 +310,14 @@ def logout(request: Request):
 # ------------------------------
 @app.post("/api/chat")
 def chat(payload: ChatIn, request: Request, email: str = Depends(_require_auth)):
+    if AWS_BEDROCK_MODE:
+        # Direct Bedrock KB RAG path
+        try:
+            ans = bedrock_retrieve_and_generate(payload.query, payload.top_k or 5)
+        except Exception as e:
+            raise HTTPException(500, f"Bedrock error: {e}")
+        return {"answer": ans, "contexts": []}
+
     vertexai_init(project=PROJECT_ID, location=LOCATION)
 
     # 1) Router (non-streaming)
@@ -340,6 +384,23 @@ def sse(event: str, data: dict) -> bytes:
 @app.get("/api/chat/stream")
 async def chat_stream(request: Request, q: str, top_k: int = 5, model: str = "base", token: str = "", rid: str = ""):
     email = _require_auth(request)
+    if AWS_BEDROCK_MODE:
+        # For AWS mode, do a one-shot Bedrock call and stream minimal events
+        async def gen_bedrock():
+            yield sse("route", {"domain": "sanctions", "top_k": max(1, top_k), "use_tuned": (BEDROCK_MODEL_ARN != ""), "task": q, "model": _bedrock_model_arn()})
+            try:
+                ans = bedrock_retrieve_and_generate(q, top_k)
+            except Exception as e:
+                ans = f"Bedrock error: {e}"
+            yield sse("final", {"answer": ans})
+        headers = {
+            "Cache-Control": "no-cache",
+            "Content-Type": "text/event-stream",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        }
+        return StreamingResponse(gen_bedrock(), headers=headers)
+
     vertexai_init(project=PROJECT_ID, location=LOCATION)
 
     async def gen():
