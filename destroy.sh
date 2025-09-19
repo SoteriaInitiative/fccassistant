@@ -9,6 +9,12 @@ require() { command -v "$1" >/dev/null 2>&1 || die "'$1' not found. Please insta
 require aws
 require jq
 
+# Error context surfaced on failure
+CURRENT_STAGE="init"
+trap 'echo "[ERROR] Stage=$CURRENT_STAGE region=$region profile=$profile — last command failed. See AWS error above." >&2' ERR
+
+stage_info(){ echo "[stage:$1] region=$region profile=$profile ${2:-}"; }
+
 # -------- Parameters (env-overridable) --------
 stack_name="${stack_name:-ofac-rag-kb}"
 region="${region:-us-east-1}"
@@ -29,6 +35,13 @@ OSS_COLLECTION_NAME="${OSS_COLLECTION_NAME:-e2e-rag-collection}"
 SFT_ROLE_NAME="${SFT_ROLE_NAME:-ofac-bedrock-sft-role}"
 # Custom model name prefix used by deployment (controls which PT + models to remove)
 CUSTOM_MODEL_PREFIX="${custom_model_prefix:-ofac-nova-custom-}"
+APP_RUNNER_SERVICE_NAME="${apprunner_service_name:-fccassistant-web}"
+APP_RUNNER_ROLE_NAME="${apprunner_exec_role_name:-apprunner-bedrock-exec-role}"
+# App image/ECR + CodeBuild resources created by deploy.sh app
+APP_ECR_REPO="${app_image_name:-fccassistant-app}"
+CB_PROJECT_NAME="${cb_project_name:-fccassistant-app-build}"
+CB_ROLE_NAME="${cb_role_name:-fccassistant-codebuild-role}"
+APP_ECR_ACCESS_ROLE_NAME="${apprunner_ecr_access_role_name:-apprunner-ecr-access-role}"
 
 confirm() {
   local msg=${1:-Are you sure?}
@@ -39,6 +52,7 @@ confirm() {
 }
 
 delete_stack() {
+  CURRENT_STAGE="destroy:stack"
   local name="$1"
   if aws cloudformation describe-stacks --stack-name "$name" --region "$region" --profile "$profile" >/dev/null 2>&1; then
     log "Deleting CloudFormation stack: $name"
@@ -79,6 +93,7 @@ empty_and_remove_bucket() {
 }
 
 delete_kbs_and_data_sources() {
+  CURRENT_STAGE="destroy:kbs"
   log "Scanning for Bedrock Knowledge Bases named '$KB_NAME'…"
   local kbs_json kb_id kb_name
   if ! kbs_json=$(aws bedrock-agent list-knowledge-bases --region "$region" --profile "$profile" 2>/dev/null || true); then
@@ -111,6 +126,7 @@ delete_kbs_and_data_sources() {
 }
 
 delete_custom_models_and_pt() {
+  CURRENT_STAGE="destroy:models-pt"
   log "Scanning for Bedrock PT + custom models with prefix '$CUSTOM_MODEL_PREFIX' and deleting them in order…"
 
   # Build list of custom model ARNs that match our prefix (used to filter PTs)
@@ -165,6 +181,7 @@ delete_custom_models_and_pt() {
 }
 
 delete_aoss_collections() {
+  CURRENT_STAGE="destroy:aoss"
   log "Checking for OpenSearch Serverless collections named '$OSS_COLLECTION_NAME'…"
   if aws opensearchserverless list-collections --region "$region" --profile "$profile" >/dev/null 2>&1; then
     local cols
@@ -189,6 +206,7 @@ delete_aoss_collections() {
 }
 
 delete_sft_role() {
+  CURRENT_STAGE="destroy:role"
   local role="$SFT_ROLE_NAME"
   if aws iam get-role --role-name "$role" --region "$region" --profile "$profile" >/dev/null 2>&1; then
     log "Deleting IAM role: $role (removing inline policies first)"
@@ -238,30 +256,112 @@ verify_cleanup() {
 main() {
   log "Destroy starting for stack=$stack_name, region=$region, profile=$profile"
 
-  if ! confirm "Proceed to delete CloudFormation stack '$stack_name' and related resources?"; then
-    die "Aborted by user."
-  fi
-
-  # 1) Delete CFN stack (removes nested KB/OSS infra defined by templates)
-  delete_stack "$stack_name"
-
-  # 2) Best-effort explicit cleanup of Bedrock entities and AOSS collections (in case any remain)
-  delete_kbs_and_data_sources || true
-  delete_aoss_collections || true
-  delete_custom_models_and_pt || true
-
-  # 3) Remove S3 buckets (deployment + data buckets)
-  empty_and_remove_bucket "$DEPLOYMENT_BUCKET" || true
-  empty_and_remove_bucket "$source_docs_s3_bucket" || true
-  empty_and_remove_bucket "$corpus_s3_bucket" || true
-  empty_and_remove_bucket "$tuning_s3_bucket" || true
-
-  # 4) Remove SFT IAM role (created by tune flow)
-  delete_sft_role || true
-
-  # 5) Verify nothing remains per our filters
-  verify_cleanup
-  log "Destroy completed."
+  # Targeted deletion support
+  target="${1:-all}"
+  case "$target" in
+    all)
+      if ! confirm "Proceed to delete CloudFormation stack '$stack_name' and related resources?"; then die "Aborted."; fi
+      delete_stack "$stack_name"
+      delete_kbs_and_data_sources || true
+      delete_aoss_collections || true
+      delete_custom_models_and_pt || true
+      empty_and_remove_bucket "$DEPLOYMENT_BUCKET" || true
+      empty_and_remove_bucket "$source_docs_s3_bucket" || true
+      empty_and_remove_bucket "$corpus_s3_bucket" || true
+      empty_and_remove_bucket "$tuning_s3_bucket" || true
+      delete_sft_role || true
+      # App Runner service (if exists)
+      if aws apprunner list-services --region "$region" --profile "$profile" >/dev/null 2>&1; then
+        SRN=$(aws apprunner list-services --region "$region" --profile "$profile" | jq -r ".ServiceSummaryList[]|select(.ServiceName==\"$APP_RUNNER_SERVICE_NAME\")|.ServiceArn")
+        if [[ -n "$SRN" ]]; then
+          log "Deleting App Runner service: $APP_RUNNER_SERVICE_NAME"
+          aws apprunner delete-service --service-arn "$SRN" --region "$region" --profile "$profile" || true
+        fi
+      fi
+      verify_cleanup
+      ;;
+    data)
+      empty_and_remove_bucket "$source_docs_s3_bucket" || true
+      empty_and_remove_bucket "$corpus_s3_bucket" || true
+      ;;
+    embedding)
+      if ! confirm "Delete stack '$stack_name' (KB/OSS infra)?"; then die "Aborted."; fi
+      delete_stack "$stack_name"
+      delete_kbs_and_data_sources || true
+      delete_aoss_collections || true
+      ;;
+    model)
+      delete_custom_models_and_pt || true
+      delete_sft_role || true
+      ;;
+    endpoint)
+      # Only PTs
+      log "Deleting provisioned throughputs related to prefix '$CUSTOM_MODEL_PREFIX'"
+      if aws bedrock list-provisioned-model-throughputs --region "$region" --profile "$profile" >/dev/null 2>&1; then
+        aws bedrock list-provisioned-model-throughputs --region "$region" --profile "$profile" \
+          | jq -r --arg p "$CUSTOM_MODEL_PREFIX" '.provisionedModelSummaries[]?|select(.provisionedModelName|startswith($p) or (.provisionedModelName|endswith("-pt")))|.provisionedModelArn' \
+          | while read -r pt; do
+              [[ -z "$pt" ]] && continue
+              aws bedrock delete-provisioned-model-throughput --provisioned-model-arn "$pt" --region "$region" --profile "$profile" || true
+            done
+      fi
+      ;;
+    app)
+      if aws apprunner list-services --region "$region" --profile "$profile" >/dev/null 2>&1; then
+        SRN=$(aws apprunner list-services --region "$region" --profile "$profile" | jq -r ".ServiceSummaryList[]|select(.ServiceName==\"$APP_RUNNER_SERVICE_NAME\")|.ServiceArn")
+        if [[ -n "$SRN" ]]; then
+          log "Deleting App Runner service: $APP_RUNNER_SERVICE_NAME"
+          aws apprunner delete-service --service-arn "$SRN" --region "$region" --profile "$profile" || true
+        else
+          log "App Runner service not found: $APP_RUNNER_SERVICE_NAME"
+        fi
+      fi
+      # Optional: remove App Runner exec role
+      if aws iam get-role --role-name "$APP_RUNNER_ROLE_NAME" --region "$region" --profile "$profile" >/dev/null 2>&1; then
+        for pol in $(aws iam list-role-policies --role-name "$APP_RUNNER_ROLE_NAME" --region "$region" --profile "$profile" --query 'PolicyNames[]' --output text || true); do
+          aws iam delete-role-policy --role-name "$APP_RUNNER_ROLE_NAME" --policy-name "$pol" --region "$region" --profile "$profile" || true
+        done
+        aws iam delete-role --role-name "$APP_RUNNER_ROLE_NAME" --region "$region" --profile "$profile" || true
+      fi
+      # Remove ECR access role for App Runner
+      if aws iam get-role --role-name "$APP_ECR_ACCESS_ROLE_NAME" --region "$region" --profile "$profile" >/dev/null 2>&1; then
+        # Detach managed policy first
+        aws iam detach-role-policy --role-name "$APP_ECR_ACCESS_ROLE_NAME" --policy-arn arn:aws:iam::aws:policy/service-role/AWSAppRunnerServicePolicyForECRAccess --region "$region" --profile "$profile" || true
+        for pol in $(aws iam list-role-policies --role-name "$APP_ECR_ACCESS_ROLE_NAME" --region "$region" --profile "$profile" --query 'PolicyNames[]' --output text || true); do
+          aws iam delete-role-policy --role-name "$APP_ECR_ACCESS_ROLE_NAME" --policy-name "$pol" --region "$region" --profile "$profile" || true
+        done
+        aws iam delete-role --role-name "$APP_ECR_ACCESS_ROLE_NAME" --region "$region" --profile "$profile" || true
+      fi
+      # Delete CodeBuild project and its role
+      if aws codebuild batch-get-projects --names "$CB_PROJECT_NAME" --region "$region" --profile "$profile" >/dev/null 2>&1; then
+        log "Deleting CodeBuild project: $CB_PROJECT_NAME"
+        aws codebuild delete-project --name "$CB_PROJECT_NAME" --region "$region" --profile "$profile" || true
+      fi
+      if aws iam get-role --role-name "$CB_ROLE_NAME" --region "$region" --profile "$profile" >/dev/null 2>&1; then
+        for pol in $(aws iam list-role-policies --role-name "$CB_ROLE_NAME" --region "$region" --profile "$profile" --query 'PolicyNames[]' --output text || true); do
+          aws iam delete-role-policy --role-name "$CB_ROLE_NAME" --policy-name "$pol" --region "$region" --profile "$profile" || true
+        done
+        aws iam delete-role --role-name "$CB_ROLE_NAME" --region "$region" --profile "$profile" || true
+      fi
+      # Delete ECR repo (remove images first)
+      if aws ecr describe-repositories --repository-names "$APP_ECR_REPO" --region "$region" --profile "$profile" >/dev/null 2>&1; then
+        log "Deleting ECR repository images and repo: $APP_ECR_REPO"
+        IMG_IDS=$(aws ecr list-images --repository-name "$APP_ECR_REPO" --region "$region" --profile "$profile" --query 'imageIds' --output json)
+        if [[ "$IMG_IDS" != "[]" && -n "$IMG_IDS" ]]; then
+          aws ecr batch-delete-image --repository-name "$APP_ECR_REPO" --image-ids "$IMG_IDS" --region "$region" --profile "$profile" || true
+        fi
+        aws ecr delete-repository --repository-name "$APP_ECR_REPO" --force --region "$region" --profile "$profile" || true
+      fi
+      # Remove app source objects in deployment bucket (but not the bucket itself)
+      if aws s3api head-bucket --bucket "$DEPLOYMENT_BUCKET" --region "$region" --profile "$profile" >/dev/null 2>&1; then
+        log "Cleaning S3 app-source/* from s3://$DEPLOYMENT_BUCKET"
+        aws s3 rm "s3://$DEPLOYMENT_BUCKET/app-source/" --recursive --region "$region" --profile "$profile" || true
+      fi
+      ;;
+    *)
+      die "Unknown target '$target'. Use: all|data|embedding|model|endpoint|app" ;;
+  esac
+  log "Destroy stage '$target' completed."
 }
 
 main "$@"
