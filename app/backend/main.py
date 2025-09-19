@@ -26,19 +26,41 @@ logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("fcc-ai-agent")
 
 # ------------------------------
-# Env configuration (Cloud Run)
+# Env configuration (provider-agnostic)
 # ------------------------------
 PROJECT_ID         = os.getenv("PROJECT_ID")
 LOCATION           = os.getenv("LOCATION", "us-central1")
 BASE_MODEL_NAME    = os.getenv("BASE_MODEL_NAME", "")  # publisher path or short; prefer full publisher path
 TUNED_MODEL_NAME   = os.getenv("TUNED_MODEL_NAME", "") # endpoint path when tuned, e.g.: projects/.../endpoints/...
-ROUTER_MODEL_NAME  = os.getenv("ROUTER_MODEL_NAME", f"projects/{PROJECT_ID}/locations/{LOCATION}/publishers/google/models/gemini-2.0-flash")
-GCS_FULL_PATH = os.getenv("GCS_PREFIX", "")
-parts = GCS_FULL_PATH.split('/')
-GCS_BUCKET         = parts[-2]
-GCS_PREFIX         = parts[-1]
+ROUTER_MODEL_NAME  = os.getenv(
+    "ROUTER_MODEL_NAME",
+    (f"projects/{PROJECT_ID}/locations/{LOCATION}/publishers/google/models/gemini-2.0-flash"
+     if PROJECT_ID else "publishers/google/models/gemini-2.0-flash")
+)
+
+def _parse_gcs_prefix(s: Optional[str]) -> tuple[str, str]:
+    """Parse env GCS_PREFIX into (bucket, prefix) safely.
+    Accepts forms: "", "bucket", "bucket/prefix", "gs://bucket", "gs://bucket/prefix".
+    Returns ("", "") if empty/invalid.
+    """
+    s = (s or "").strip()
+    if not s:
+        return "", ""
+    if s.startswith("gs://"):
+        s = s[5:]
+    s = s.strip("/")
+    if not s:
+        return "", ""
+    parts = s.split("/", 1)
+    bucket = parts[0].strip()
+    prefix = parts[1].strip("/") if len(parts) > 1 else ""
+    if not bucket:
+        return "", ""
+    return bucket, prefix
+
+GCS_BUCKET, GCS_PREFIX = _parse_gcs_prefix(os.getenv("GCS_PREFIX", ""))
 WORKDIR            = os.getenv("WORKDIR", "/workspace")  # folder that has embeddings/faiss/corpus
-ALLOW_CORS_ALL     = os.getenv("ALLOW_CORS_ALL", "1") == "1"
+ALLOW_CORS_ALL     = os.getenv("ALLOW_CORS_ALL", "1").lower() in ("1", "true", "yes")
 ALLOWED_USERS      = os.getenv("ALLOWED_USERS", "")      # "email:pw,email2:pw2"
 
 # AWS Bedrock (optional) — if enabled, the app uses Bedrock KB RAG instead of Vertex + local FAISS
@@ -61,7 +83,7 @@ os.makedirs(GCS_CACHE_DIR, exist_ok=True)
 # ------------------------------
 app = FastAPI(title="FCC AI Assistant")
 
-if ALLOW_CORS_ALL == "1":
+if ALLOW_CORS_ALL:
     app.add_middleware(
         CORSMiddleware,
         allow_origins=["*"], allow_credentials=True,
