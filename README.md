@@ -33,13 +33,13 @@ For a web based chat app see further below.
 
 Set the initial environment parameters - do replace with your own!
 ```bash
-export GCP_ACCOUNT="fccassistant27@gmail.com"
-export PROJECT_ID="fcc-assistant-mvp"
-export PROJECT_NUM="526463352197"
-export GCS_PREFIX="gs://fcc-assistant-84/index"
-export SA_EMAIL="526463352197-compute@developer.gserviceaccount.com"
-export REGION="us-central1"
-export BUCKET="gs://fcc-assistant-84"
+export GCP_ACCOUNT="GCP_ACCOUNT_EMAIL"
+export PROJECT_ID="GCP_PROJECT_ID"
+export PROJECT_NUM="GCP_PROJECT_NUM"
+export GCS_PREFIX="gs://GCP_BUCKET/index"
+export SA_EMAIL="GCP_PROJECT_NUM-compute@developer.gserviceaccount.com"
+export REGION="GCP_REGION"
+export BUCKET="gs://GCP_BUCKET"
 ```
 
 Initiate the local environment - NOTE: Check ``setup.sh`` for any local settings you may need!
@@ -95,13 +95,13 @@ the custom model or not. When the fine-tuned model is not used, inference will b
 
 Set the initial environment parameters - do replace with your own!
 ```bash
-export GCP_ACCOUNT="fccassistant27@gmail.com"
-export PROJECT_ID="fcc-assistant-mvp"
-export PROJECT_NUM="526463352197"
-export GCS_PREFIX="gs://fcc-assistant-84/index"
-export SA_EMAIL="526463352197-compute@developer.gserviceaccount.com"
-export REGION="us-central1"
-export BUCKET="gs://fcc-assistant-84"
+export GCP_ACCOUNT="GCP_ACCOUNT_EMAIL"
+export PROJECT_ID="GCP_PROJECT_ID"
+export PROJECT_NUM="GCP_PROJECT_NUM"
+export GCS_PREFIX="gs://GCP_BUCKET/index"
+export SA_EMAIL="GCP_PROJECT_NUM-compute@developer.gserviceaccount.com"
+export REGION="GCP_REGION"
+export BUCKET="gs://GCP_BUCKET"
 ```
 
 In case you plan to change any of the model functionality (different embedding, chunking or tuning settings)
@@ -137,8 +137,8 @@ gcloud ai endpoints list --region=$REGION
 
 2) When you have obtained the values update the below and export the parameters.
 ```bash
-export MODEL_ID="2867371294100291584"
-export MODEL_ENDPOINT_ID="1429685073992482816"
+export MODEL_ID="GCP_MODEL_ID"
+export MODEL_ENDPOINT_ID="MODEL_ENDPOINT_ID"
 ```
 
 3) Set the application parameters - NOTE: replace with your own!
@@ -186,15 +186,23 @@ This section deploys the FastAPI app in `app/` to AWS App Runner and configures 
 Bases for retrieval and generation (RAG). The Google path remains unchanged; AWS is enabled via environment variables.
 
 Prerequisites
-- You have run `./deploy.sh` and created the Bedrock Knowledge Base, OpenSearch Serverless collection, and 
-optionally completed fine‑tuning and created Provisioned Throughput (PT).
-- Docker is installed and you are authenticated to AWS ECR.
+- You have run `bash deploy.sh embedding` and all previous steps and created the Bedrock Knowledge Base, 
+OpenSearch Serverless collection, and optionally completed 
+fine‑tuning with ```bash deploy.sh model``` and created Provisioned Throughput (PT).
 - Your account has the required IAM permissions for App Runner, ECR, and Bedrock.
 
+Scripted App Deployment
+If you run ```bash deploy.sh all``` the web application will automatically be created for you, if the 
+creation of provisioned throughput fails however you can simply run ```bash deploy.sh app```
+to create a fresh AppRunner service. The service URL will be displayed at the end of the deployment.
+
+
+Manual App Deployment
+To deploy each of the web app components manuall follow the steps below.
 1) Discover IDs from the deployed stack
 ```bash
-export REGION=us-east-1
-export PROFILE=FCCAssistant
+export REGION=AWS_REGION
+export PROFILE=AWS_ACCOUNT_PROFILE
 export STACK=ofac-rag-kb
 
 # Get KB ID
