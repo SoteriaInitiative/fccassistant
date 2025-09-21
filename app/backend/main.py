@@ -217,20 +217,33 @@ def _bedrock_model_arn() -> str:
     return f"arn:aws:bedrock:{AWS_REGION}::foundation-model/{BEDROCK_BASE_MODEL_ID}"
 
 def bedrock_retrieve_and_generate(question: str, top_k: int = 5) -> str:
-    """Call Bedrock KB retrieve-and-generate using KB ID and model ARN from env."""
+    """Call Bedrock Agent Runtime RetrieveAndGenerate with a Knowledge Base.
+
+    Uses boto3 client 'bedrock-agent-runtime' and the request shape:
+      input: { text }
+      retrieveAndGenerateConfiguration:
+        type: 'KNOWLEDGE_BASE'
+        knowledgeBaseConfiguration:
+          knowledgeBaseId, modelArn, retrievalConfiguration.vectorSearchConfiguration.numberOfResults
+    """
     if not BEDROCK_KB_ID:
         raise HTTPException(500, "BEDROCK_KB_ID not configured for AWS mode")
     client = boto3.client("bedrock-agent-runtime", region_name=AWS_REGION)
-    cfg = {
-        "vectorSearchConfiguration": {
-            "numberOfResults": max(1, min(int(top_k or 5), 15))
-        }
-    }
+    k = max(1, min(int(top_k or 5), 15))
     req = {
-        "knowledgeBaseId": BEDROCK_KB_ID,
-        "modelArn": _bedrock_model_arn(),
-        "retrievalQuery": {"text": question},
-        "retrievalConfiguration": cfg,
+        "input": {"text": question},
+        "retrieveAndGenerateConfiguration": {
+            "type": "KNOWLEDGE_BASE",
+            "knowledgeBaseConfiguration": {
+                "knowledgeBaseId": os.environ["BEDROCK_KB_ID"],
+                "modelArn": os.environ["BEDROCK_MODEL_ARN"],
+                "retrievalConfiguration": {
+                    "vectorSearchConfiguration": {
+                        "numberOfResults": k
+                    }
+                }
+            }
+        }
     }
     resp = client.retrieve_and_generate(**req)
     out = resp.get("output", {}).get("text") or ""
@@ -409,7 +422,15 @@ async def chat_stream(request: Request, q: str, top_k: int = 5, model: str = "ba
     if AWS_BEDROCK_MODE:
         # For AWS mode, do a one-shot Bedrock call and stream minimal events
         async def gen_bedrock():
-            yield sse("route", {"domain": "sanctions", "top_k": max(1, top_k), "use_tuned": (BEDROCK_MODEL_ARN != ""), "task": q, "model": _bedrock_model_arn()})
+            yield sse("route",
+                      {
+                            "domain": "sanctions",
+                            "top_k": max(1, top_k),
+                            "use_tuned": bool(BEDROCK_MODEL_ARN),
+                            "task": q,
+                            "model": _bedrock_model_arn(),
+                      }
+            )
             try:
                 ans = bedrock_retrieve_and_generate(q, top_k)
             except Exception as e:

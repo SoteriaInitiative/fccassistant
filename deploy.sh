@@ -384,8 +384,8 @@ main() {
     --policy-document "$POLICY" \
     --profile "$profile" --region "$region"
   echo "SFT Role created: ${SFT_ROLE_NAME} with:"
-  echo "ROLE POLICY:$TRUST"
-  echo "ACCESS POLICY: $POLICY"
+  #echo "ROLE POLICY:$TRUST"
+  #echo "ACCESS POLICY: $POLICY"
 
   echo "Waiting role creation..."
   CURRENT_STAGE="all:wait-sft-role"; aws iam wait role-exists --role-name "$SFT_ROLE_NAME" --profile "$profile" --region "$region"
@@ -577,7 +577,7 @@ stage_embedding() {
   aws s3 cp ${LOCAL_TEMPLATES_DIR} s3://${DEPLOYMENT_BUCKET}/${LOCAL_TEMPLATES_DIR}/ --recursive --profile ${profile} --region ${region}
   template_s3_url="https://${DEPLOYMENT_BUCKET}.s3.${region}.amazonaws.com/templates/main-template-out.yml"
   echo "Validating template: $template_s3_url"
-  aws cloudformation validate-template --template-url "$template_s3_url" --region "$region" --profile "$profile"
+  aws cloudformation validate-template --template-url "$template_s3_url" --region "$region" --profile "$profile" >/dev/null 2>&1
 
   echo "Creating stack: $stack_name in $region"
   aws cloudformation create-stack \
@@ -765,6 +765,8 @@ stage_app_only() {
     aws iam create-role --role-name "$CB_ROLE_NAME" --assume-role-policy-document "$CB_TRUST" --region "$region" --profile "$profile" >/dev/null 2>&1 || true
     aws iam put-role-policy --role-name "$CB_ROLE_NAME" --policy-name CBAccess --policy-document "$CB_POL" --region "$region" --profile "$profile"
     CB_ROLE_ARN=$(aws iam get-role --role-name "$CB_ROLE_NAME" --region "$region" --profile "$profile" | jq -r .Role.Arn)
+    echo "Waiting for CodeBuild role creation ..."
+    sleep 20
     # Create or update CodeBuild project
     CB_NAME="fccassistant-app-build"
     CB_ENV=$(jq -n '{type:"LINUX_CONTAINER",image:"aws/codebuild/standard:7.0",computeType:"BUILD_GENERAL1_SMALL",privilegedMode:true}')
@@ -821,6 +823,10 @@ YAML
   PT_ARN=$(aws bedrock list-provisioned-model-throughputs --region "$region" --profile "$profile" | jq -r --arg n "${CUSTOM_MODEL_NAME}-pt" '.provisionedModelSummaries[]?|select(.provisionedModelName==$n)|.provisionedModelArn' | head -n1)
   #BASE_MODEL_ID="amazon.nova-micro-v1:0"
 
+  # Fallback model ARN if no Provisioned Throughput ARN is available
+  FM_ARN="arn:aws:bedrock:${region}::foundation-model/${BASE_MODEL_ID/:128k/}"
+  MODEL_ARN="${PT_ARN:-$FM_ARN}"
+
   echo "Creating App Runner service role..."
   ROLE_NAME="apprunner-bedrock-exec-role"
   TRUST=$(jq -n '{Version:"2012-10-17",Statement:[{Effect:"Allow",Principal:{Service:"tasks.apprunner.amazonaws.com"},Action:"sts:AssumeRole"}]}')
@@ -847,6 +853,7 @@ YAML
     --arg region "$region" \
     --arg kb     "$KB_ID" \
     --arg pt     "$PT_ARN" \
+    --arg modelArn "$MODEL_ARN" \
     --arg base   "$BASE_MODEL_ID" \
     --arg users  "$allowed_user_pw" \
     '{
@@ -859,7 +866,7 @@ YAML
             AWS_BEDROCK_MODE: "1",
             AWS_REGION: $region,
             BEDROCK_KB_ID: $kb,
-            BEDROCK_MODEL_ARN: $pt,
+            BEDROCK_MODEL_ARN: $modelArn,
             BEDROCK_BASE_MODEL_ID: $base,
             ALLOW_CORS_ALL: "1",
             ALLOWED_USERS: $users
