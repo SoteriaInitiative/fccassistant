@@ -95,13 +95,8 @@ the custom model or not. When the fine-tuned model is not used, inference will b
 
 Set the initial environment parameters - do replace with your own!
 ```bash
-export GCP_ACCOUNT="GCP_ACCOUNT_EMAIL"
-export PROJECT_ID="GCP_PROJECT_ID"
-export PROJECT_NUM="GCP_PROJECT_NUM"
-export GCS_PREFIX="gs://GCP_BUCKET/index"
-export SA_EMAIL="GCP_PROJECT_NUM-compute@developer.gserviceaccount.com"
-export REGION="GCP_REGION"
-export BUCKET="gs://GCP_BUCKET"
+export region="AWS_REGION"
+export profile="AWS_ACCOUNT_PROFILE"
 ```
 
 In case you plan to change any of the model functionality (different embedding, chunking or tuning settings)
