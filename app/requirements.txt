@@ -13,6 +13,7 @@ google-cloud-aiplatform  # satisfies ADK >=1.87.0
 
 # GCS + storage
 google-cloud-storage
+boto3
 
 # App deps
 faiss-cpu

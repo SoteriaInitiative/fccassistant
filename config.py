@@ -1,7 +1,7 @@
 # ---- USER / PROJECT ----
-PROJECT_ID = "fcc-assistant-mvp"
-LOCATION = "us-central1"
-GCS_CORPUS_BUCKET = "fcc-assistant-84"  # gs://fcc-assistant-mvp-42
+PROJECT_ID = "GCP_PROJECT_ID"
+LOCATION = "GCP_REGION"
+GCS_CORPUS_BUCKET = "GCP_BUCKET"
 WORKDIR = ".cache_corpus"  # local scratch download
 LOCAL_DATA = "data"
 

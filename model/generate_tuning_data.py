@@ -1,4 +1,4 @@
-import os, re, json
+import os, re, json, argparse
 from pathlib import Path
 from typing import Iterable, Dict, Any, Tuple
 
@@ -34,6 +34,24 @@ def _upload_to_gcs(local_path: Path, dest_filename: str) -> str:
     blob = bucket.blob(object_path)
     blob.upload_from_filename(str(local_path))
     return f"gs://{bucket_name}/{object_path}"
+
+# ------------------
+# AWS S3 (optional)
+# ------------------
+def _s3_session(profile: str | None = None, region: str | None = None):
+    import boto3
+    return boto3.Session(profile_name=profile, region_name=region) if (profile or region) else boto3.Session()
+
+def _upload_to_s3(local_path: Path, bucket: str, prefix: str, dest_filename: str, profile: str | None = None, region: str | None = None) -> str:
+    import mimetypes
+    session = _s3_session(profile, region)
+    s3 = session.client("s3")
+    # Use either the CLI-provided prefix or fall back to TUNING_PREFIX, but not both.
+    effective_prefix = prefix.strip("/") or TUNING_PREFIX
+    key = "/".join([p for p in [effective_prefix, dest_filename] if p])
+    ctype = mimetypes.guess_type(dest_filename)[0] or "application/octet-stream"
+    s3.upload_file(str(local_path), bucket, key, ExtraArgs={"ContentType": ctype})
+    return f"s3://{bucket}/{key}"
 
 def load_chunks_jsonl(path: Path) -> Iterable[dict]:
     with path.open("r", encoding="utf-8") as f:
@@ -79,7 +97,31 @@ def make_row(user_text: str, model_text: str) -> Dict[str, Any]:
         ]
     })
 
-def main():
+def bedrock_messages_row(user_text: str, assistant_text: str) -> Dict[str, Any]:
+    """Return a Bedrock-compatible messages row for SFT.
+
+    Format (per Amazon Bedrock fine-tuning docs):
+    {"messages": [
+        {"role": "user", "content": [{"text": "..."}]},
+        {"role": "assistant", "content": [{"text": "..."}]}
+    ]}
+    """
+    return {
+        "messages": [
+            {"role": "user", "content": [{"text": str(user_text)}]},
+            {"role": "assistant", "content": [{"text": str(assistant_text)}]},
+        ]
+    }
+
+def main(argv: list[str] | None = None):
+    parser = argparse.ArgumentParser(description="Generate supervised tuning JSONL and upload to cloud storage")
+    parser.add_argument("provider", nargs="?", default="gcp", choices=["gcp", "aws"], help="Where to upload the output (default: gcp)")
+    parser.add_argument("--aws-output-bucket", default=None, help="S3 bucket to upload tuning JSONL (when provider=aws)")
+    parser.add_argument("--aws-output-prefix", default="", help="S3 prefix for tuning output (when provider=aws)")
+    parser.add_argument("--aws-region", default=None, help="AWS region for S3")
+    parser.add_argument("--aws-profile", default=None, help="AWS profile for S3")
+    args = parser.parse_args(argv)
+
     workdir = Path(WORKDIR)
     src = workdir / "corpus_chunks.jsonl"
     dst = workdir / OUT_NAME
@@ -97,18 +139,30 @@ def main():
                 continue
             user_text = f"{INSTRUCTION}\n\n{text}"
             model_text = naive_summary(text)
-            fout.write(json.dumps(make_row(user_text, model_text), ensure_ascii=False) + "\n")
+            if args.provider == "aws":
+                row = bedrock_messages_row(user_text, model_text)
+            else:
+                row = make_row(user_text, model_text)
+            fout.write(json.dumps(row, ensure_ascii=False) + "\n")
             n_out += 1
             if n_out >= MAX_PAIRS:
                 break
 
     print(f"✅ Wrote {n_out} examples to {dst}")
 
-    # Upload to GCS
-    uri = _upload_to_gcs(dst, OUT_NAME)
+    if args.provider == "aws":
+        if not args.aws_output_bucket:
+            raise SystemExit("❌ --aws-output-bucket is required for provider=aws")
+        uri = _upload_to_s3(dst, args.aws_output_bucket, args.aws_output_prefix or "", OUT_NAME, profile=args.aws_profile, region=args.aws_region)
+    else:
+        uri = _upload_to_gcs(dst, OUT_NAME)
     print(f"☁️  Uploaded to {uri}")
-    print("   • Schema: Generate Content JSONL (`contents`, roles user/model)")
-    print("   • Ready for Vertex tuning.")
+    if args.provider == "aws":
+        print("   • Schema: Bedrock messages JSONL (`messages`, roles user/assistant)")
+        print("   • Ready for tuning on Amazon Bedrock.")
+    else:
+        print("   • Schema: Generate Content JSONL (`contents`, roles user/model)")
+        print("   • Ready for tuning (Vertex on GCP or Bedrock on AWS).")
 
 if __name__ == "__main__":
     main()
